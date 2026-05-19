@@ -1,0 +1,31 @@
+# WinCarry runtime output
+/config/
+/apps/
+/portable/
+/scoop/
+/manifests/
+/backups/
+/restore-scripts/
+/reports/
+/logs/
+
+# Codex/workspace metadata
+/.git/
+/.agents/
+/.codex/
+
+# Local test roots
+/WinCarry-Test*/
+/tmp/
+
+# PowerShell/editor noise
+*.ps1xml.backup
+*.tmp
+*.temp
+*.log
+
+# OS/editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
