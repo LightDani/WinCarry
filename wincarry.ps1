@@ -803,8 +803,9 @@ function Invoke-ExternalCommandCapture {
 
 function Convert-FixedWidthTable {
     param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$Lines,
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [string[]]$Lines = @(),
 
         [Parameter(Mandatory = $true)]
         [string[]]$ColumnNames,
@@ -812,6 +813,10 @@ function Convert-FixedWidthTable {
         [Parameter(Mandatory = $true)]
         [string[]]$RequiredColumnNames
     )
+
+    if ($null -eq $Lines -or $Lines.Count -eq 0) {
+        return @()
+    }
 
     $headerIndex = -1
     $header = ""
@@ -867,7 +872,7 @@ function Convert-FixedWidthTable {
         }
 
         $trimmed = $line.Trim()
-        if ($trimmed -match "^-+$") {
+        if ($trimmed -match "^[-\s]+$") {
             continue
         }
         if ($trimmed -match "^\S+\s+\d+%$") {
@@ -1022,8 +1027,13 @@ function Get-WingetEvidence {
         $records += (New-ScanEvidenceRecord -Source "winget" -EvidenceType "package-manager-list" -Data $data)
     }
 
-    if (($records.Count -eq 0) -and ($capture.lines.Count -gt 0)) {
-        $warnings += "winget output was captured but no table rows were parsed."
+    $nonEmptyLines = @($capture.lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($records.Count -eq 0) {
+        if ($nonEmptyLines.Count -gt 0) {
+            $warnings += "winget output was captured but no table rows were parsed."
+        } else {
+            $warnings += "winget returned no output."
+        }
     }
 
     return [ordered]@{
@@ -1118,8 +1128,13 @@ function Get-ScoopEvidence {
         $records += (New-ScanEvidenceRecord -Source "scoop" -EvidenceType "package-manager-list" -Data $data)
     }
 
-    if (($records.Count -eq 0) -and ($capture.lines.Count -gt 0)) {
-        $warnings += "Scoop output was captured but no table rows were parsed."
+    $nonEmptyLines = @($capture.lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($records.Count -eq 0) {
+        if ($nonEmptyLines.Count -gt 0) {
+            $warnings += "Scoop output was captured but no table rows were parsed."
+        } else {
+            $warnings += "Scoop returned no output."
+        }
     }
 
     return [ordered]@{
