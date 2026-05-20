@@ -914,6 +914,86 @@ function Convert-FixedWidthTable {
     return $rows
 }
 
+function Convert-WingetListFallbackTable {
+    param(
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [string[]]$Lines = @()
+    )
+
+    if ($null -eq $Lines -or $Lines.Count -eq 0) {
+        return @()
+    }
+
+    $rows = @()
+    $seenSeparator = $false
+
+    foreach ($line in $Lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+
+        $trimmed = $line.Trim()
+        if ($trimmed -match "^[-\s]+$") {
+            $seenSeparator = $true
+            continue
+        }
+        if ($trimmed -match "^\S+\s+\d+%$") {
+            continue
+        }
+        if ($trimmed -match "No installed package") {
+            continue
+        }
+
+        $parts = @($trimmed -split "\s{2,}" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($parts.Count -lt 2) {
+            continue
+        }
+
+        if ($parts[1] -ieq "Id") {
+            continue
+        }
+        if ((-not $seenSeparator) -and ($parts[0] -match "^(Name|Nama)$")) {
+            continue
+        }
+
+        $name = $parts[0].Trim()
+        $packageId = $parts[1].Trim()
+        if ([string]::IsNullOrWhiteSpace($name) -or [string]::IsNullOrWhiteSpace($packageId)) {
+            continue
+        }
+
+        $version = ""
+        $available = ""
+        $source = ""
+
+        if ($parts.Count -ge 3) {
+            $version = $parts[2].Trim()
+        }
+        if ($parts.Count -eq 4) {
+            if ($parts[3] -match "^(winget|msstore)$") {
+                $source = $parts[3].Trim()
+            } else {
+                $available = $parts[3].Trim()
+            }
+        }
+        if ($parts.Count -ge 5) {
+            $available = $parts[3].Trim()
+            $source = $parts[4].Trim()
+        }
+
+        $rows += [ordered]@{
+            Name = $name
+            Id = $packageId
+            Version = $version
+            Available = $available
+            Source = $source
+        }
+    }
+
+    return $rows
+}
+
 function New-ScanEvidenceRecord {
     param(
         [Parameter(Mandatory = $true)]
@@ -1013,6 +1093,9 @@ function Get-WingetEvidence {
     }
 
     $rows = Convert-FixedWidthTable -Lines $capture.lines -ColumnNames @("Name", "Id", "Version", "Available", "Source") -RequiredColumnNames @("Name", "Id")
+    if ($rows.Count -eq 0) {
+        $rows = Convert-WingetListFallbackTable -Lines $capture.lines
+    }
     foreach ($row in $rows) {
         $data = [ordered]@{
             name = [string]$row["Name"]
