@@ -4,7 +4,7 @@ WinCarry is an early-stage PowerShell toolkit for reducing Windows reinstall fri
 
 It is intended to help users prepare for a Windows reinstall by scanning apps, generating manifests, backing up selected configuration, and later restoring/reinstalling selected apps through safe workflows.
 
-Current status: alpha. The CLI skeleton, setup flow, and preflight system snapshot are implemented.
+Current status: alpha. The CLI skeleton, setup flow, preflight system snapshot, and raw app detection scan are implemented.
 
 ## What It Does Not Guarantee
 
@@ -33,10 +33,17 @@ Implemented:
   - package manager availability for `winget`, Chocolatey, and Scoop
   - root/protected-path validation
   - report/log output when the WinCarry root has been set up
+- `scan` raw app detection:
+  - registry uninstall keys on Windows
+  - `winget list`
+  - `choco list --local-only`
+  - `scoop list`
+  - Start Menu shortcuts
+  - known folders as supporting evidence only
+  - raw JSON output when the WinCarry root has been set up
 
 Commands planned for later phases currently show placeholders and make no changes:
 
-- `scan`
 - `backup`
 - `manifest`
 - `restore`
@@ -84,6 +91,18 @@ Preview preflight without writing a report or log:
 .\wincarry.ps1 preflight -Root "D:\WinCarry" -DryRun
 ```
 
+Run a raw app detection scan:
+
+```powershell
+.\wincarry.ps1 scan -Root "D:\WinCarry"
+```
+
+Preview scan without writing raw JSON or a log:
+
+```powershell
+.\wincarry.ps1 scan -Root "D:\WinCarry" -DryRun
+```
+
 ## Windows PowerShell Verification
 
 Run these from the repository directory on Windows:
@@ -95,6 +114,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 setup -Root "
 powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 setup -Root "$env:TEMP\WinCarry-Test"
 powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 preflight -Root "$env:TEMP\WinCarry-Test" -DryRun
 powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 preflight -Root "$env:TEMP\WinCarry-Test"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 scan -Root "$env:TEMP\WinCarry-Test" -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 scan -Root "$env:TEMP\WinCarry-Test"
 ```
 
 Expected result:
@@ -106,6 +127,9 @@ Expected result:
 - preflight dry-run prints the system snapshot and writes nothing
 - preflight prints OS/user/admin/drive/package-manager/root details
 - preflight writes a report under `reports` and updates the setup log when the root exists
+- scan dry-run prints raw evidence counts and writes nothing
+- scan writes raw detection JSON under `reports` and updates the setup log when the root exists
+- scan treats known-folder presence as supporting evidence only, not proof of an installed app
 
 ## Linux PowerShell Verification
 
@@ -118,6 +142,8 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 setup -Root /tmp/WinC
 pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 setup -Root /tmp/WinCarry-Test-Phase1
 pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 preflight -Root /tmp/WinCarry-Test-Phase1 -DryRun
 pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 preflight -Root /tmp/WinCarry-Test-Phase1
+pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 scan -Root /tmp/WinCarry-Test-Phase1 -DryRun
+pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 scan -Root /tmp/WinCarry-Test-Phase1
 ```
 
 Use Linux-native paths such as `/tmp/...` when invoking `pwsh` from a Linux shell.
