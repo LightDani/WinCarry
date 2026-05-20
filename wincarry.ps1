@@ -769,6 +769,7 @@ function Invoke-ExternalCommandCapture {
         return [ordered]@{
             available = $false
             command = $CommandName
+            arguments = @($Arguments)
             source = ""
             exitCode = $null
             lines = @()
@@ -784,6 +785,7 @@ function Invoke-ExternalCommandCapture {
         return [ordered]@{
             available = $true
             command = $CommandName
+            arguments = @($Arguments)
             source = $command.Source
             exitCode = $exitCode
             lines = $lines
@@ -793,6 +795,7 @@ function Invoke-ExternalCommandCapture {
         return [ordered]@{
             available = $true
             command = $CommandName
+            arguments = @($Arguments)
             source = $command.Source
             exitCode = $LASTEXITCODE
             lines = @()
@@ -994,6 +997,71 @@ function Convert-WingetListFallbackTable {
     return $rows
 }
 
+function Get-CommandOutputSample {
+    param(
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [string[]]$Lines = @(),
+
+        [int]$Limit = 5
+    )
+
+    $sample = @()
+    foreach ($line in $Lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+
+        $trimmed = $line.Trim()
+        if ($trimmed.Length -gt 160) {
+            $trimmed = $trimmed.Substring(0, 160) + "..."
+        }
+
+        $sample += $trimmed
+        if ($sample.Count -ge $Limit) {
+            break
+        }
+    }
+
+    return $sample
+}
+
+function Convert-WingetCaptureToRows {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Capture
+    )
+
+    $warnings = @()
+    $argumentText = (($Capture.arguments | ForEach-Object { [string]$_ }) -join " ").Trim()
+    if ([string]::IsNullOrWhiteSpace($argumentText)) {
+        $argumentText = "<none>"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Capture.error)) {
+        $warnings += ("winget {0} failed: {1}" -f $argumentText, $Capture.error)
+    }
+
+    if (($null -ne $Capture.exitCode) -and ($Capture.exitCode -ne 0)) {
+        $warnings += ("winget {0} exited with code {1}." -f $argumentText, $Capture.exitCode)
+    }
+
+    $rows = @(Convert-FixedWidthTable -Lines $Capture.lines -ColumnNames @("Name", "Id", "Version", "Available", "Source") -RequiredColumnNames @("Name", "Id"))
+    $parser = "fixed-width"
+    if ($rows.Count -eq 0) {
+        $rows = @(Convert-WingetListFallbackTable -Lines $Capture.lines)
+        $parser = "whitespace-fallback"
+    }
+
+    return [ordered]@{
+        rows = $rows
+        parser = $parser
+        warnings = $warnings
+        outputSample = @(Get-CommandOutputSample -Lines $Capture.lines)
+        argumentText = $argumentText
+    }
+}
+
 function New-ScanEvidenceRecord {
     param(
         [Parameter(Mandatory = $true)]
@@ -1079,7 +1147,7 @@ function Get-RegistryUninstallEvidence {
 function Get-WingetEvidence {
     $records = @()
     $warnings = @()
-    $capture = Invoke-ExternalCommandCapture -CommandName "winget" -Arguments @("list", "--disable-interactivity")
+    $capture = Invoke-ExternalCommandCapture -CommandName "winget" -Arguments @("list", "--source", "winget", "--disable-interactivity")
 
     if (-not $capture.available) {
         return [ordered]@{
@@ -1088,14 +1156,41 @@ function Get-WingetEvidence {
         }
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($capture.error)) {
-        $warnings += ("winget list failed: {0}" -f $capture.error)
+    $parsed = Convert-WingetCaptureToRows -Capture $capture
+    $rows = @($parsed.rows)
+    $selectedCapture = $capture
+    $selectedParsed = $parsed
+
+    if ($rows.Count -eq 0) {
+        $fallbackCapture = Invoke-ExternalCommandCapture -CommandName "winget" -Arguments @("list", "--disable-interactivity")
+        $fallbackParsed = Convert-WingetCaptureToRows -Capture $fallbackCapture
+        $fallbackRows = @($fallbackParsed.rows)
+
+        if ($fallbackRows.Count -gt 0) {
+            $warnings += $parsed.warnings
+            $warnings += ("winget {0} returned no parseable package rows; used fallback command: {1}." -f $parsed.argumentText, $fallbackParsed.argumentText)
+            $warnings += $fallbackParsed.warnings
+            $rows = $fallbackRows
+            $selectedCapture = $fallbackCapture
+            $selectedParsed = $fallbackParsed
+        } else {
+            $warnings += $parsed.warnings
+            if ($parsed.outputSample.Count -gt 0) {
+                $warnings += ("winget {0} output sample: {1}" -f $parsed.argumentText, ($parsed.outputSample -join " | "))
+            }
+
+            $warnings += $fallbackParsed.warnings
+            if ($fallbackParsed.outputSample.Count -gt 0) {
+                $warnings += ("winget {0} output sample: {1}" -f $fallbackParsed.argumentText, ($fallbackParsed.outputSample -join " | "))
+            }
+
+            $selectedCapture = $fallbackCapture
+            $selectedParsed = $fallbackParsed
+        }
+    } else {
+        $warnings += $parsed.warnings
     }
 
-    $rows = Convert-FixedWidthTable -Lines $capture.lines -ColumnNames @("Name", "Id", "Version", "Available", "Source") -RequiredColumnNames @("Name", "Id")
-    if ($rows.Count -eq 0) {
-        $rows = Convert-WingetListFallbackTable -Lines $capture.lines
-    }
     foreach ($row in $rows) {
         $data = [ordered]@{
             name = [string]$row["Name"]
@@ -1103,14 +1198,16 @@ function Get-WingetEvidence {
             version = [string]$row["Version"]
             available = [string]$row["Available"]
             source = [string]$row["Source"]
-            commandSource = [string]$capture.source
-            exitCode = [string]$capture.exitCode
+            commandSource = [string]$selectedCapture.source
+            commandArguments = [string]$selectedParsed.argumentText
+            exitCode = [string]$selectedCapture.exitCode
+            parser = [string]$selectedParsed.parser
         }
 
         $records += (New-ScanEvidenceRecord -Source "winget" -EvidenceType "package-manager-list" -Data $data)
     }
 
-    $nonEmptyLines = @($capture.lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $nonEmptyLines = @($selectedCapture.lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($records.Count -eq 0) {
         if ($nonEmptyLines.Count -gt 0) {
             $warnings += "winget output was captured but no table rows were parsed."
