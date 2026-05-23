@@ -10,6 +10,7 @@ Current implemented scope:
 - Dry-run and confirmation helpers
 - Preflight system snapshot
 - App detection scan with raw evidence, deduplication, and classification
+- Manifest and report generation
 #>
 
 [CmdletBinding()]
@@ -179,6 +180,90 @@ function Get-ScanOutputPath {
 
     $scanFileName = "raw-scan-{0}.json" -f (Get-FileTimestamp)
     return (Join-Path (Join-Path $RootPath "reports") $scanFileName)
+}
+
+function Get-ManifestPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Timestamp
+    )
+
+    $manifestFileName = "{0}_manifest.json" -f $Timestamp
+    return (Join-Path (Join-Path $RootPath "manifests") $manifestFileName)
+}
+
+function Get-LatestManifestPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath
+    )
+
+    return (Join-Path (Join-Path $RootPath "manifests") "latest.json")
+}
+
+function Get-ScanReportPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Timestamp,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("md", "txt")]
+        [string]$Extension
+    )
+
+    $reportFileName = "scan-{0}.{1}" -f $Timestamp, $Extension
+    return (Join-Path (Join-Path $RootPath "reports") $reportFileName)
+}
+
+function Get-ManualReinstallListPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Timestamp
+    )
+
+    $fileName = "manual-reinstall-{0}.txt" -f $Timestamp
+    return (Join-Path (Join-Path $RootPath "reports") $fileName)
+}
+
+function Get-UnsupportedListPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Timestamp
+    )
+
+    $fileName = "unsupported-{0}.txt" -f $Timestamp
+    return (Join-Path (Join-Path $RootPath "reports") $fileName)
+}
+
+function Get-ManifestArtifactPaths {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Timestamp
+    )
+
+    return [ordered]@{
+        manifest = (Get-ManifestPath -RootPath $RootPath -Timestamp $Timestamp)
+        latestManifest = (Get-LatestManifestPath -RootPath $RootPath)
+        reportMarkdown = (Get-ScanReportPath -RootPath $RootPath -Timestamp $Timestamp -Extension "md")
+        reportText = (Get-ScanReportPath -RootPath $RootPath -Timestamp $Timestamp -Extension "txt")
+        manualReinstallList = (Get-ManualReinstallListPath -RootPath $RootPath -Timestamp $Timestamp)
+        unsupportedList = (Get-UnsupportedListPath -RootPath $RootPath -Timestamp $Timestamp)
+    }
 }
 
 function Write-WinCarryLog {
@@ -1779,6 +1864,545 @@ function Get-ClassificationSummary {
     return $summary
 }
 
+function Get-ObjectKeys {
+    param($Object)
+
+    if ($null -eq $Object) {
+        return @()
+    }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        return @($Object.Keys)
+    }
+
+    return @($Object.PSObject.Properties.Name)
+}
+
+function ConvertTo-ArrayValue {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return @()
+    }
+
+    return @($Value | Where-Object { $null -ne $_ -and -not ($_ -is [string] -and [string]::IsNullOrWhiteSpace($_)) })
+}
+
+function Get-AppPackages {
+    param($App)
+
+    $packages = ConvertTo-ArrayValue -Value (Get-MapValue -Map $App -Key "packages")
+    if ($packages.Count -gt 0) {
+        return @($packages)
+    }
+
+    return @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $App -Key "package"))
+}
+
+function Test-AppHasPackageId {
+    param($App)
+
+    foreach ($package in (Get-AppPackages -App $App)) {
+        $packageId = [string](Get-MapValue -Map $package -Key "id")
+        if (-not [string]::IsNullOrWhiteSpace($packageId)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-AppPackageSummaryText {
+    param($App)
+
+    $parts = @()
+    foreach ($package in (Get-AppPackages -App $App)) {
+        $manager = [string](Get-MapValue -Map $package -Key "manager")
+        $packageId = [string](Get-MapValue -Map $package -Key "id")
+        if ([string]::IsNullOrWhiteSpace($packageId)) {
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($manager)) {
+            $parts += $packageId
+        } else {
+            $parts += ("{0}:{1}" -f $manager, $packageId)
+        }
+    }
+
+    if ($parts.Count -eq 0) {
+        return "manual"
+    }
+
+    return ($parts -join ", ")
+}
+
+function Get-AppReasonsText {
+    param($App)
+
+    $reasons = ConvertTo-ArrayValue -Value (Get-MapValue -Map $App -Key "reasons")
+    if ($reasons.Count -eq 0) {
+        return "No reason recorded."
+    }
+
+    return (($reasons | ForEach-Object { [string]$_ }) -join " ")
+}
+
+function Get-AppWarningsText {
+    param($App)
+
+    $warnings = ConvertTo-ArrayValue -Value (Get-MapValue -Map $App -Key "warnings")
+    if ($warnings.Count -eq 0) {
+        return ""
+    }
+
+    return (($warnings | ForEach-Object { [string]$_ }) -join " ")
+}
+
+function Get-ConfidenceSummary {
+    param([object[]]$Apps)
+
+    $summary = [ordered]@{}
+    foreach ($app in $Apps) {
+        $key = [string](Get-MapValue -Map $app -Key "restoreConfidence")
+        if ([string]::IsNullOrWhiteSpace($key)) {
+            $key = "Unknown"
+        }
+        if (-not $summary.Contains($key)) {
+            $summary[$key] = 0
+        }
+        $summary[$key] = [int]$summary[$key] + 1
+    }
+
+    return $summary
+}
+
+function Get-ManualReinstallApps {
+    param([object[]]$Apps)
+
+    $manualClassifications = @(
+        "Installer-based / manual reinstall",
+        "Unknown",
+        "Portable / Self-contained",
+        "Service-heavy"
+    )
+
+    return @($Apps | Where-Object {
+        $confidence = [string](Get-MapValue -Map $_ -Key "restoreConfidence")
+        $classification = [string](Get-MapValue -Map $_ -Key "classification")
+        $strategy = [string](Get-MapValue -Map $_ -Key "restoreStrategy")
+        $hasPackage = Test-AppHasPackageId -App $_
+
+        ($confidence -ne "Unsupported") -and (
+            (-not $hasPackage) -or
+            ($strategy -eq "manual-reinstall") -or
+            ($manualClassifications -contains $classification)
+        )
+    })
+}
+
+function Get-UnsupportedApps {
+    param([object[]]$Apps)
+
+    return @($Apps | Where-Object {
+        $confidence = [string](Get-MapValue -Map $_ -Key "restoreConfidence")
+        $classification = [string](Get-MapValue -Map $_ -Key "classification")
+        ($confidence -eq "Unsupported") -or ($classification -eq "Unsupported / risky") -or ($classification -eq "Driver / system component") -or ($classification -eq "Microsoft Store / UWP")
+    })
+}
+
+function New-AppSummaryRecord {
+    param($App)
+
+    return [ordered]@{
+        id = [string](Get-MapValue -Map $App -Key "id")
+        name = [string](Get-MapValue -Map $App -Key "name")
+        classification = [string](Get-MapValue -Map $App -Key "classification")
+        restoreConfidence = [string](Get-MapValue -Map $App -Key "restoreConfidence")
+        restoreStrategy = [string](Get-MapValue -Map $App -Key "restoreStrategy")
+        package = (Get-AppPackageSummaryText -App $App)
+        reasons = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $App -Key "reasons"))
+        warnings = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $App -Key "warnings"))
+    }
+}
+
+function Convert-PackageManagerStatusToMap {
+    param(
+        [object[]]$PackageManagers,
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath
+    )
+
+    $map = [ordered]@{}
+    foreach ($manager in $PackageManagers) {
+        $name = [string](Get-MapValue -Map $manager -Key "name")
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+
+        $entry = [ordered]@{
+            available = [bool](Get-MapValue -Map $manager -Key "available")
+            version = [string](Get-MapValue -Map $manager -Key "version")
+            source = [string](Get-MapValue -Map $manager -Key "source")
+        }
+        if ($name -eq "scoop") {
+            $entry["root"] = (Join-Path $RootPath "scoop")
+        }
+
+        $map[$name] = $entry
+    }
+
+    return $map
+}
+
+function Convert-AppForManifest {
+    param(
+        [Parameter(Mandatory = $true)]
+        $App,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DetectedAt
+    )
+
+    return [ordered]@{
+        id = [string](Get-MapValue -Map $App -Key "id")
+        name = [string](Get-MapValue -Map $App -Key "name")
+        publisher = [string](Get-MapValue -Map $App -Key "publisher")
+        versionDetected = [string](Get-MapValue -Map $App -Key "versionDetected")
+        installLocation = [string](Get-MapValue -Map $App -Key "installLocation")
+        executablePath = [string](Get-MapValue -Map $App -Key "executablePath")
+        source = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $App -Key "sources"))
+        package = (Get-MapValue -Map $App -Key "package")
+        packages = @(Get-AppPackages -App $App)
+        classification = [string](Get-MapValue -Map $App -Key "classification")
+        restoreConfidence = [string](Get-MapValue -Map $App -Key "restoreConfidence")
+        restoreStrategy = [string](Get-MapValue -Map $App -Key "restoreStrategy")
+        reasons = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $App -Key "reasons"))
+        warnings = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $App -Key "warnings"))
+        configPaths = @()
+        detectedAt = $DetectedAt
+    }
+}
+
+function New-AppManifestFromScan {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Scan
+    )
+
+    $rootPath = [string]$Scan.root.resolvedRoot
+    $os = Get-OperatingSystemInfo
+    $user = Get-CurrentUserInfo
+    $admin = Get-AdminStatus
+    $packageManagers = @(Get-PackageManagerStatus)
+    $apps = @($Scan.apps | ForEach-Object { Convert-AppForManifest -App $_ -DetectedAt $Scan.createdAt })
+    $manualApps = @(Get-ManualReinstallApps -Apps $apps | ForEach-Object { New-AppSummaryRecord -App $_ })
+    $unsupportedApps = @(Get-UnsupportedApps -Apps $apps | ForEach-Object { New-AppSummaryRecord -App $_ })
+
+    return [ordered]@{
+        schemaVersion = "1.0"
+        createdAt = (Get-Date).ToString("o")
+        toolName = $script:ToolName
+        sourceScan = [ordered]@{
+            schemaVersion = [string]$Scan.schemaVersion
+            createdAt = [string]$Scan.createdAt
+            evidenceCount = @($Scan.evidence).Count
+            sourceCounts = $Scan.sources
+            warnings = @($Scan.warnings)
+        }
+        machine = [ordered]@{
+            computerName = [string]$user.machineName
+            windowsVersion = ("{0} {1}" -f $os.caption, $os.architecture)
+            osCaption = [string]$os.caption
+            osVersion = [string]$os.version
+            architecture = [string]$os.architecture
+            userName = [string]$user.userName
+            userDomain = [string]$user.domainName
+            userProfile = [string]$user.userProfile
+            isAdmin = [bool]$admin.isAdmin
+        }
+        root = [ordered]@{
+            winCarryRoot = $rootPath
+        }
+        packageManagers = (Convert-PackageManagerStatusToMap -PackageManagers $packageManagers -RootPath $rootPath)
+        summary = [ordered]@{
+            appCount = $apps.Count
+            evidenceCount = @($Scan.evidence).Count
+            classificationSummary = (Get-ClassificationSummary -Apps $apps)
+            restoreConfidenceSummary = (Get-ConfidenceSummary -Apps $apps)
+            manualReinstallCount = $manualApps.Count
+            unsupportedCount = $unsupportedApps.Count
+        }
+        apps = @($apps)
+        manualReinstall = @($manualApps)
+        unsupported = @($unsupportedApps)
+    }
+}
+
+function ConvertTo-MarkdownCell {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ""
+    }
+
+    $clean = $Text -replace "[\r\n]+", " "
+    return ($clean -replace "\|", "\|")
+}
+
+function Add-MapSummaryLines {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Lines,
+
+        $Map
+    )
+
+    foreach ($key in (Get-ObjectKeys -Object $Map | Sort-Object)) {
+        $value = Get-MapValue -Map $Map -Key $key
+        $Lines.Add(("- {0}: {1}" -f $key, $value))
+    }
+}
+
+function Convert-ManifestReportToMarkdown {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Manifest
+    )
+
+    $summary = Get-MapValue -Map $Manifest -Key "summary"
+    $machine = Get-MapValue -Map $Manifest -Key "machine"
+    $root = Get-MapValue -Map $Manifest -Key "root"
+    $sourceScan = Get-MapValue -Map $Manifest -Key "sourceScan"
+    $apps = ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "apps")
+    $manualApps = ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "manualReinstall")
+    $unsupportedApps = ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "unsupported")
+    $packageManagers = Get-MapValue -Map $Manifest -Key "packageManagers"
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("# WinCarry Scan Report")
+    $lines.Add("")
+    $lines.Add(("Created: {0}" -f (Get-MapValue -Map $Manifest -Key "createdAt")))
+    $lines.Add(("Manifest schema: {0}" -f (Get-MapValue -Map $Manifest -Key "schemaVersion")))
+    $lines.Add(("WinCarry root: {0}" -f (Get-MapValue -Map $root -Key "winCarryRoot")))
+    $lines.Add("")
+    $lines.Add("> Restore confidence is a risk classification, not a success rate or guarantee.")
+    $lines.Add("")
+
+    $lines.Add("## System")
+    $lines.Add("")
+    $lines.Add(("- Computer: {0}" -f (Get-MapValue -Map $machine -Key "computerName")))
+    $lines.Add(("- Windows: {0}" -f (Get-MapValue -Map $machine -Key "windowsVersion")))
+    $lines.Add(("- User: {0}\\{1}" -f (Get-MapValue -Map $machine -Key "userDomain"), (Get-MapValue -Map $machine -Key "userName")))
+    $lines.Add(("- Profile: {0}" -f (Get-MapValue -Map $machine -Key "userProfile")))
+    $lines.Add(("- Is admin/root: {0}" -f (Get-MapValue -Map $machine -Key "isAdmin")))
+    $lines.Add("")
+
+    $lines.Add("## Summary")
+    $lines.Add("")
+    $lines.Add(("- Apps: {0}" -f (Get-MapValue -Map $summary -Key "appCount")))
+    $lines.Add(("- Evidence records: {0}" -f (Get-MapValue -Map $summary -Key "evidenceCount")))
+    $lines.Add(("- Manual reinstall / review: {0}" -f (Get-MapValue -Map $summary -Key "manualReinstallCount")))
+    $lines.Add(("- Unsupported / do not restore automatically: {0}" -f (Get-MapValue -Map $summary -Key "unsupportedCount")))
+    $lines.Add("")
+
+    $lines.Add("## Classification Summary")
+    $lines.Add("")
+    Add-MapSummaryLines -Lines $lines -Map (Get-MapValue -Map $summary -Key "classificationSummary")
+    $lines.Add("")
+
+    $lines.Add("## Restore Confidence Summary")
+    $lines.Add("")
+    Add-MapSummaryLines -Lines $lines -Map (Get-MapValue -Map $summary -Key "restoreConfidenceSummary")
+    $lines.Add("")
+
+    $lines.Add("## Package Managers")
+    $lines.Add("")
+    foreach ($managerName in (Get-ObjectKeys -Object $packageManagers | Sort-Object)) {
+        $manager = Get-MapValue -Map $packageManagers -Key $managerName
+        $available = Get-MapValue -Map $manager -Key "available"
+        $version = [string](Get-MapValue -Map $manager -Key "version")
+        if ([string]::IsNullOrWhiteSpace($version)) {
+            $version = "version unknown"
+        }
+        $lines.Add(("- {0}: available={1}; {2}" -f $managerName, $available, $version))
+    }
+    $lines.Add("")
+
+    $warnings = ConvertTo-ArrayValue -Value (Get-MapValue -Map $sourceScan -Key "warnings")
+    if ($warnings.Count -gt 0) {
+        $lines.Add("## Scan Warnings")
+        $lines.Add("")
+        foreach ($warning in $warnings) {
+            $lines.Add(("- {0}: {1}" -f (Get-MapValue -Map $warning -Key "source"), (Get-MapValue -Map $warning -Key "message")))
+        }
+        $lines.Add("")
+    }
+
+    $lines.Add("## Manual Reinstall / Review List")
+    $lines.Add("")
+    if ($manualApps.Count -eq 0) {
+        $lines.Add("No manual reinstall/review apps recorded.")
+    } else {
+        $lines.Add("| App | Classification | Restore confidence | Package | Reason |")
+        $lines.Add("| --- | --- | --- | --- | --- |")
+        foreach ($app in $manualApps) {
+            $lines.Add(("| {0} | {1} | {2} | {3} | {4} |" -f
+                (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $app -Key "name")),
+                (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $app -Key "classification")),
+                (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $app -Key "restoreConfidence")),
+                (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $app -Key "package")),
+                (ConvertTo-MarkdownCell -Text (Get-AppReasonsText -App $app))))
+        }
+    }
+    $lines.Add("")
+
+    $lines.Add("## Unsupported / Do Not Restore Automatically")
+    $lines.Add("")
+    if ($unsupportedApps.Count -eq 0) {
+        $lines.Add("No unsupported apps recorded.")
+    } else {
+        $lines.Add("| App | Classification | Reason |")
+        $lines.Add("| --- | --- | --- |")
+        foreach ($app in $unsupportedApps) {
+            $lines.Add(("| {0} | {1} | {2} |" -f
+                (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $app -Key "name")),
+                (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $app -Key "classification")),
+                (ConvertTo-MarkdownCell -Text (Get-AppReasonsText -App $app))))
+        }
+    }
+    $lines.Add("")
+
+    $lines.Add("## App Details")
+    $lines.Add("")
+    $lines.Add("| App | Classification | Restore confidence | Strategy | Package | Reasons | Warnings |")
+    $lines.Add("| --- | --- | --- | --- | --- | --- | --- |")
+    foreach ($app in $apps) {
+        $lines.Add(("| {0} | {1} | {2} | {3} | {4} | {5} | {6} |" -f
+            (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $app -Key "name")),
+            (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $app -Key "classification")),
+            (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $app -Key "restoreConfidence")),
+            (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $app -Key "restoreStrategy")),
+            (ConvertTo-MarkdownCell -Text (Get-AppPackageSummaryText -App $app)),
+            (ConvertTo-MarkdownCell -Text (Get-AppReasonsText -App $app)),
+            (ConvertTo-MarkdownCell -Text (Get-AppWarningsText -App $app))))
+    }
+    $lines.Add("")
+
+    $lines.Add("## Next Recommended Steps")
+    $lines.Add("")
+    $lines.Add("- Review unsupported and manual reinstall lists before formatting Windows.")
+    $lines.Add("- Do not assume apps installed outside C: will run after reinstall without repair, login, activation, services, or registry state.")
+    $lines.Add("- Prefer package-manager reinstall or portable/Scoop workflows for future apps that should survive reinstall more cleanly.")
+
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Convert-ManifestReportToText {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Manifest
+    )
+
+    $summary = Get-MapValue -Map $Manifest -Key "summary"
+    $machine = Get-MapValue -Map $Manifest -Key "machine"
+    $root = Get-MapValue -Map $Manifest -Key "root"
+    $apps = ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "apps")
+    $manualApps = ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "manualReinstall")
+    $unsupportedApps = ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "unsupported")
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("WinCarry Scan Report")
+    $lines.Add("")
+    $lines.Add(("Created: {0}" -f (Get-MapValue -Map $Manifest -Key "createdAt")))
+    $lines.Add(("Root: {0}" -f (Get-MapValue -Map $root -Key "winCarryRoot")))
+    $lines.Add(("Computer: {0}" -f (Get-MapValue -Map $machine -Key "computerName")))
+    $lines.Add(("Windows: {0}" -f (Get-MapValue -Map $machine -Key "windowsVersion")))
+    $lines.Add("")
+    $lines.Add("Restore confidence is a risk classification, not a success rate or guarantee.")
+    $lines.Add("")
+    $lines.Add("Summary")
+    $lines.Add(("- Apps: {0}" -f (Get-MapValue -Map $summary -Key "appCount")))
+    $lines.Add(("- Evidence records: {0}" -f (Get-MapValue -Map $summary -Key "evidenceCount")))
+    $lines.Add(("- Manual reinstall / review: {0}" -f $manualApps.Count))
+    $lines.Add(("- Unsupported / do not restore automatically: {0}" -f $unsupportedApps.Count))
+    $lines.Add("")
+
+    $lines.Add("Classification Summary")
+    Add-MapSummaryLines -Lines $lines -Map (Get-MapValue -Map $summary -Key "classificationSummary")
+    $lines.Add("")
+    $lines.Add("Restore Confidence Summary")
+    Add-MapSummaryLines -Lines $lines -Map (Get-MapValue -Map $summary -Key "restoreConfidenceSummary")
+    $lines.Add("")
+
+    $lines.Add("Manual Reinstall / Review List")
+    foreach ($app in $manualApps) {
+        $lines.Add(("- {0} [{1}, {2}] package={3}" -f (Get-MapValue -Map $app -Key "name"), (Get-MapValue -Map $app -Key "classification"), (Get-MapValue -Map $app -Key "restoreConfidence"), (Get-MapValue -Map $app -Key "package")))
+        $lines.Add(("  Reason: {0}" -f (Get-AppReasonsText -App $app)))
+    }
+    if ($manualApps.Count -eq 0) {
+        $lines.Add("- None")
+    }
+    $lines.Add("")
+
+    $lines.Add("Unsupported / Do Not Restore Automatically")
+    foreach ($app in $unsupportedApps) {
+        $lines.Add(("- {0} [{1}]" -f (Get-MapValue -Map $app -Key "name"), (Get-MapValue -Map $app -Key "classification")))
+        $lines.Add(("  Reason: {0}" -f (Get-AppReasonsText -App $app)))
+    }
+    if ($unsupportedApps.Count -eq 0) {
+        $lines.Add("- None")
+    }
+    $lines.Add("")
+
+    $lines.Add("App Details")
+    foreach ($app in $apps) {
+        $lines.Add(("- {0}" -f (Get-MapValue -Map $app -Key "name")))
+        $lines.Add(("  Classification: {0}" -f (Get-MapValue -Map $app -Key "classification")))
+        $lines.Add(("  Restore confidence: {0}" -f (Get-MapValue -Map $app -Key "restoreConfidence")))
+        $lines.Add(("  Strategy: {0}" -f (Get-MapValue -Map $app -Key "restoreStrategy")))
+        $lines.Add(("  Package: {0}" -f (Get-AppPackageSummaryText -App $app)))
+        $lines.Add(("  Reasons: {0}" -f (Get-AppReasonsText -App $app)))
+        $warnings = Get-AppWarningsText -App $app
+        if (-not [string]::IsNullOrWhiteSpace($warnings)) {
+            $lines.Add(("  Warnings: {0}" -f $warnings))
+        }
+    }
+
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Convert-AppSummaryListToText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Title,
+
+        [object[]]$Apps
+    )
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add($Title)
+    $lines.Add("")
+    if ($Apps.Count -eq 0) {
+        $lines.Add("No entries.")
+        return ($lines -join [Environment]::NewLine)
+    }
+
+    foreach ($app in $Apps) {
+        $lines.Add(("- {0}" -f (Get-MapValue -Map $app -Key "name")))
+        $lines.Add(("  Classification: {0}" -f (Get-MapValue -Map $app -Key "classification")))
+        $lines.Add(("  Restore confidence: {0}" -f (Get-MapValue -Map $app -Key "restoreConfidence")))
+        $lines.Add(("  Strategy: {0}" -f (Get-MapValue -Map $app -Key "restoreStrategy")))
+        $lines.Add(("  Package: {0}" -f (Get-MapValue -Map $app -Key "package")))
+        $lines.Add(("  Reasons: {0}" -f (Get-AppReasonsText -App $app)))
+        $warnings = Get-AppWarningsText -App $app
+        if (-not [string]::IsNullOrWhiteSpace($warnings)) {
+            $lines.Add(("  Warnings: {0}" -f $warnings))
+        }
+    }
+
+    return ($lines -join [Environment]::NewLine)
+}
+
 function Get-RegistryUninstallEvidence {
     $records = @()
     $warnings = @()
@@ -2324,6 +2948,176 @@ function Invoke-Scan {
     }
 }
 
+function Show-ManifestPlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Manifest,
+
+        [Parameter(Mandatory = $true)]
+        $Paths,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ActionLabel
+    )
+
+    $summary = Get-MapValue -Map $Manifest -Key "summary"
+    Write-Host ""
+    Write-Host $ActionLabel
+    Write-Host ""
+    Write-Host ("Apps: {0}" -f (Get-MapValue -Map $summary -Key "appCount"))
+    Write-Host ("Manual reinstall / review: {0}" -f (Get-MapValue -Map $summary -Key "manualReinstallCount"))
+    Write-Host ("Unsupported / do not restore automatically: {0}" -f (Get-MapValue -Map $summary -Key "unsupportedCount"))
+    Write-Host ""
+    Write-Host "Will write:"
+
+    foreach ($key in (Get-ObjectKeys -Object $Paths)) {
+        Write-Host ("- {0}" -f (Get-MapValue -Map $Paths -Key $key))
+    }
+}
+
+function Ensure-ManifestArtifactDirectories {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath
+    )
+
+    foreach ($folder in @("manifests", "reports", "logs")) {
+        $path = Join-Path $RootPath $folder
+        if (-not (Test-Path -LiteralPath $path)) {
+            New-Item -ItemType Directory -Path $path -Force | Out-Null
+        }
+    }
+}
+
+function Write-ManifestArtifacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Manifest,
+
+        [Parameter(Mandatory = $true)]
+        $Paths,
+
+        [switch]$IncludeManifestFiles
+    )
+
+    if ($IncludeManifestFiles) {
+        $manifestJson = $Manifest | ConvertTo-Json -Depth 20
+        Set-Content -LiteralPath $Paths.manifest -Value $manifestJson -Encoding UTF8
+        Set-Content -LiteralPath $Paths.latestManifest -Value $manifestJson -Encoding UTF8
+    }
+
+    $markdown = Convert-ManifestReportToMarkdown -Manifest $Manifest
+    $text = Convert-ManifestReportToText -Manifest $Manifest
+    $manualText = Convert-AppSummaryListToText -Title "WinCarry Manual Reinstall / Review List" -Apps (ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "manualReinstall"))
+    $unsupportedText = Convert-AppSummaryListToText -Title "WinCarry Unsupported / Do Not Restore Automatically List" -Apps (ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "unsupported"))
+
+    Set-Content -LiteralPath $Paths.reportMarkdown -Value $markdown -Encoding UTF8
+    Set-Content -LiteralPath $Paths.reportText -Value $text -Encoding UTF8
+    Set-Content -LiteralPath $Paths.manualReinstallList -Value $manualText -Encoding UTF8
+    Set-Content -LiteralPath $Paths.unsupportedList -Value $unsupportedText -Encoding UTF8
+}
+
+function Invoke-Manifest {
+    param(
+        [string]$RootPath,
+        [switch]$DryRunOnly
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RootPath)) {
+        $RootPath = $script:DefaultRoot
+    }
+
+    $scan = New-AppScanSnapshot -RootPath $RootPath
+    Show-AppScanSummary -Scan $scan
+
+    $manifest = New-AppManifestFromScan -Scan $scan
+    $timestamp = Get-FileTimestamp
+    $paths = Get-ManifestArtifactPaths -RootPath $scan.root.resolvedRoot -Timestamp $timestamp
+    Show-ManifestPlan -Manifest $manifest -Paths $paths -ActionLabel "Prepare Reinstall Manifest"
+
+    if ($DryRunOnly) {
+        Write-Host ""
+        Write-Info "Dry-run only. No manifest, report, list, or log files were written."
+        return
+    }
+
+    if (-not (Read-RequiredConfirmation -Prompt "Generate WinCarry manifest and report files?")) {
+        Write-Host ""
+        Write-Info "Manifest generation cancelled. No files were changed."
+        return
+    }
+
+    Ensure-ManifestArtifactDirectories -RootPath $scan.root.resolvedRoot
+    Write-ManifestArtifacts -Manifest $manifest -Paths $paths -IncludeManifestFiles
+
+    $message = "Manifest generated for root {0}; apps={1}; manual={2}; unsupported={3}; manifest={4}" -f $scan.root.resolvedRoot, $manifest.summary.appCount, $manifest.summary.manualReinstallCount, $manifest.summary.unsupportedCount, $paths.manifest
+    Write-WinCarryLog -RootPath $scan.root.resolvedRoot -Operation "manifest" -Result "success" -Message $message
+
+    Write-Host ""
+    Write-Info ("Manifest written: {0}" -f $paths.manifest)
+    Write-Info ("Latest manifest updated: {0}" -f $paths.latestManifest)
+    Write-Info ("Markdown report written: {0}" -f $paths.reportMarkdown)
+    Write-Info ("Text report written: {0}" -f $paths.reportText)
+    Write-Info ("Manual reinstall list written: {0}" -f $paths.manualReinstallList)
+    Write-Info ("Unsupported list written: {0}" -f $paths.unsupportedList)
+    Write-Info ("Log updated: {0}" -f (Get-LogPath -RootPath $scan.root.resolvedRoot))
+}
+
+function Invoke-Report {
+    param(
+        [string]$RootPath,
+        [switch]$DryRunOnly
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RootPath)) {
+        $RootPath = $script:DefaultRoot
+    }
+
+    $resolvedRoot = Resolve-DisplayPath -Path $RootPath
+    $latestManifestPath = Get-LatestManifestPath -RootPath $resolvedRoot
+    if (-not (Test-Path -LiteralPath $latestManifestPath)) {
+        Write-Host ""
+        Write-WarningText ("Latest manifest not found: {0}" -f $latestManifestPath)
+        Write-Info "Run the manifest command first."
+        return
+    }
+
+    $manifest = Get-Content -Raw -LiteralPath $latestManifestPath | ConvertFrom-Json
+    $timestamp = Get-FileTimestamp
+    $paths = Get-ManifestArtifactPaths -RootPath $resolvedRoot -Timestamp $timestamp
+    Show-ManifestPlan -Manifest $manifest -Paths ([ordered]@{
+        reportMarkdown = $paths.reportMarkdown
+        reportText = $paths.reportText
+        manualReinstallList = $paths.manualReinstallList
+        unsupportedList = $paths.unsupportedList
+    }) -ActionLabel "Generate Reports From Latest Manifest"
+
+    if ($DryRunOnly) {
+        Write-Host ""
+        Write-Info "Dry-run only. No report, list, or log files were written."
+        return
+    }
+
+    if (-not (Read-RequiredConfirmation -Prompt "Generate report files from latest manifest?")) {
+        Write-Host ""
+        Write-Info "Report generation cancelled. No files were changed."
+        return
+    }
+
+    Ensure-ManifestArtifactDirectories -RootPath $resolvedRoot
+    Write-ManifestArtifacts -Manifest $manifest -Paths $paths
+
+    $message = "Reports generated from latest manifest {0}; report={1}" -f $latestManifestPath, $paths.reportMarkdown
+    Write-WinCarryLog -RootPath $resolvedRoot -Operation "report" -Result "success" -Message $message
+
+    Write-Host ""
+    Write-Info ("Markdown report written: {0}" -f $paths.reportMarkdown)
+    Write-Info ("Text report written: {0}" -f $paths.reportText)
+    Write-Info ("Manual reinstall list written: {0}" -f $paths.manualReinstallList)
+    Write-Info ("Unsupported list written: {0}" -f $paths.unsupportedList)
+    Write-Info ("Log updated: {0}" -f (Get-LogPath -RootPath $resolvedRoot))
+}
+
 function Show-SetupPlan {
     param(
         [Parameter(Mandatory = $true)]
@@ -2435,14 +3229,14 @@ function Show-Help {
     Write-Host "  .\wincarry.ps1 setup [-Root D:\WinCarry] [-DryRun]"
     Write-Host "  .\wincarry.ps1 preflight [-Root D:\WinCarry] [-DryRun]"
     Write-Host "  .\wincarry.ps1 scan [-Root D:\WinCarry] [-DryRun]"
+    Write-Host "  .\wincarry.ps1 manifest [-Root D:\WinCarry] [-DryRun]"
+    Write-Host "  .\wincarry.ps1 report [-Root D:\WinCarry] [-DryRun]"
     Write-Host "  .\wincarry.ps1 backup"
-    Write-Host "  .\wincarry.ps1 manifest"
     Write-Host "  .\wincarry.ps1 restore"
-    Write-Host "  .\wincarry.ps1 report"
     Write-Host "  .\wincarry.ps1 offline"
     Write-Host "  .\wincarry.ps1 junction"
     Write-Host ""
-    Write-Host "Implemented: CLI shell, setup, preflight system snapshot, and app detection with classification."
+    Write-Host "Implemented: CLI shell, setup, preflight, app detection/classification, manifests, and reports."
     Write-Host "Later-phase commands currently show placeholders and make no changes."
 }
 
@@ -2490,9 +3284,21 @@ function Show-MainMenu {
                 Invoke-Scan -RootPath $rootInput
             }
             "4" { Show-CommandPlaceholder -CommandName "backup" -Phase "Phase 6" }
-            "5" { Show-CommandPlaceholder -CommandName "manifest" -Phase "Phase 5" }
+            "5" {
+                $rootInput = Read-Host ("WinCarry root [{0}]" -f $script:DefaultRoot)
+                if ([string]::IsNullOrWhiteSpace($rootInput)) {
+                    $rootInput = $script:DefaultRoot
+                }
+                Invoke-Manifest -RootPath $rootInput
+            }
             "6" { Show-CommandPlaceholder -CommandName "restore" -Phase "Phase 7" }
-            "7" { Show-CommandPlaceholder -CommandName "report" -Phase "Phase 5" }
+            "7" {
+                $rootInput = Read-Host ("WinCarry root [{0}]" -f $script:DefaultRoot)
+                if ([string]::IsNullOrWhiteSpace($rootInput)) {
+                    $rootInput = $script:DefaultRoot
+                }
+                Invoke-Report -RootPath $rootInput
+            }
             "8" { Show-CommandPlaceholder -CommandName "junction" -Phase "Phase 10" }
             "9" { Show-CommandPlaceholder -CommandName "offline" -Phase "Phase 11" }
             "0" {
@@ -2528,9 +3334,9 @@ function Invoke-CommandRouter {
         "preflight" { Invoke-Preflight -RootPath $Root -DryRunOnly:$DryRun }
         "scan" { Invoke-Scan -RootPath $Root -DryRunOnly:$DryRun }
         "backup" { Show-CommandPlaceholder -CommandName "backup" -Phase "Phase 6" }
-        "manifest" { Show-CommandPlaceholder -CommandName "manifest" -Phase "Phase 5" }
+        "manifest" { Invoke-Manifest -RootPath $Root -DryRunOnly:$DryRun }
         "restore" { Show-CommandPlaceholder -CommandName "restore" -Phase "Phase 7" }
-        "report" { Show-CommandPlaceholder -CommandName "report" -Phase "Phase 5" }
+        "report" { Invoke-Report -RootPath $Root -DryRunOnly:$DryRun }
         "offline" { Show-CommandPlaceholder -CommandName "offline" -Phase "Phase 11" }
         "junction" { Show-CommandPlaceholder -CommandName "junction" -Phase "Phase 10" }
         "help" { Show-Help }
