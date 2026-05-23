@@ -1635,9 +1635,9 @@ function Set-LogicalAppClassification {
     $isKnownFolderOnly = ($sources.Count -eq 1 -and $sources[0] -eq "knownFolder")
     $hasSystemComponentEvidence = (@($App.evidence | Where-Object { [string](Get-MapValue -Map $_ -Key "systemComponent") -eq "1" }).Count -gt 0)
 
-    $runtimePattern = "(visual c\+\+.*(redistributable|runtime)|\.net.*(runtime|sdk|desktop runtime)|webview2 runtime|directx|windows sdk)"
+    $runtimePattern = "(visual c\+\+.*(redistribut|runtime|runt|minimum|additional|debug|uwp)|\.net.*(runtime|sdk|desktop runtime)|webview2 runtime|directx|windows sdk)"
     $driverPattern = "\b(driver|virtual display|virtual usb|chipset|firmware|printer driver|scanner driver|bluetooth driver|audio driver|display driver)\b"
-    $securityPattern = "\b(antivirus|endpoint|edr|firewall|vpn|wireguard|openvpn|nordvpn|proton vpn|security agent)\b"
+    $securityPattern = "\b(antivirus|endpoint|edr|firewall|[a-z0-9]*vpn[a-z0-9]*|wireguard|security agent)\b"
 
     if (Test-AppEvidenceTextMatch -App $App -Pattern $runtimePattern -Fields @("name", "publisher", "packageId")) {
         $classification = "Unsupported / risky"
@@ -1654,11 +1654,6 @@ function Set-LogicalAppClassification {
         $confidence = "Unsupported"
         $strategy = "do-not-restore"
         $reasons += "Security or network software may include services, drivers, certificates, or policy state."
-    } elseif ($hasSystemComponentEvidence) {
-        $classification = "Unsupported / risky"
-        $confidence = "Unsupported"
-        $strategy = "do-not-restore"
-        $reasons += "Registry marks this entry as a Windows system component."
     } elseif (Test-AppTextMatch -App $App -Pattern "\b(windowsapps|msstore)\b") {
         $classification = "Microsoft Store / UWP"
         $confidence = "Unsupported"
@@ -1692,6 +1687,11 @@ function Set-LogicalAppClassification {
         $confidence = "Medium"
         $strategy = "reinstall-via-package-manager"
         $reasons += "Found Chocolatey package metadata."
+    } elseif ($hasSystemComponentEvidence) {
+        $classification = "Unsupported / risky"
+        $confidence = "Unsupported"
+        $strategy = "do-not-restore"
+        $reasons += "Registry marks this entry as a Windows system component."
     } elseif ($sources -contains "registry") {
         $classification = "Installer-based / manual reinstall"
         $confidence = "Low"
@@ -1710,6 +1710,9 @@ function Set-LogicalAppClassification {
     }
     if ($sources.Count -gt 0) {
         $reasons += ("Evidence sources: {0}." -f (($sources | Sort-Object) -join ", "))
+    }
+    if ($hasSystemComponentEvidence -and ($hasWinget -or $hasChocolatey -or $hasScoop)) {
+        $warnings += "Registry also marks one entry as a system component; prefer package-manager reinstall and verify manually."
     }
 
     $App.classification = $classification
