@@ -1190,12 +1190,6 @@ function Test-StrongNameMatch {
         return $true
     }
 
-    if ($leftNormalized.Length -ge 4 -and $rightNormalized.Length -ge 4) {
-        if ($leftNormalized.Contains($rightNormalized) -or $rightNormalized.Contains($leftNormalized)) {
-            return $true
-        }
-    }
-
     $leftTokens = @(Get-NameTokens -Name $Left)
     $rightTokens = @(Get-NameTokens -Name $Right)
     if ($leftTokens.Count -eq 0 -or $rightTokens.Count -eq 0) {
@@ -1464,6 +1458,13 @@ function Add-CandidateToLogicalApp {
         source = [string]$Candidate.source
         evidenceType = [string]$Candidate.evidenceType
         name = [string]$Candidate.name
+        publisher = [string]$Candidate.publisher
+        version = [string]$Candidate.version
+        installLocation = [string]$Candidate.installLocation
+        executablePath = [string]$Candidate.executablePath
+        packageManager = [string]$Candidate.packageManager
+        packageId = [string]$Candidate.packageId
+        systemComponent = [string]$Candidate.systemComponent
     }
     $App.evidenceCount = $App.evidence.Count
 
@@ -1581,6 +1582,39 @@ function Test-AppTextMatch {
     return ($text -match $Pattern)
 }
 
+function Test-AppEvidenceTextMatch {
+    param(
+        [Parameter(Mandatory = $true)]
+        $App,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Pattern,
+
+        [string[]]$Fields = @("name", "publisher", "packageId")
+    )
+
+    foreach ($evidence in @($App.evidence)) {
+        $parts = @()
+        foreach ($field in $Fields) {
+            $value = [string](Get-MapValue -Map $evidence -Key $field)
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                $parts += $value
+            }
+        }
+
+        if ($parts.Count -eq 0) {
+            continue
+        }
+
+        $text = ($parts -join " ").ToLowerInvariant()
+        if ($text -match $Pattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Set-LogicalAppClassification {
     param(
         [Parameter(Mandatory = $true)]
@@ -1599,27 +1633,32 @@ function Set-LogicalAppClassification {
     $hasChocolatey = (@($packages | Where-Object { $_.manager -eq "chocolatey" }).Count -gt 0)
     $hasScoop = (@($packages | Where-Object { $_.manager -eq "scoop" }).Count -gt 0)
     $isKnownFolderOnly = ($sources.Count -eq 1 -and $sources[0] -eq "knownFolder")
+    $hasSystemComponentEvidence = (@($App.evidence | Where-Object { [string](Get-MapValue -Map $_ -Key "systemComponent") -eq "1" }).Count -gt 0)
 
-    if ($App.identity.systemComponent -eq "1") {
-        $classification = "Driver / system component"
-        $confidence = "Unsupported"
-        $strategy = "do-not-restore"
-        $reasons += "Registry marks this entry as a Windows system component."
-    } elseif (Test-AppTextMatch -App $App -Pattern "\b(driver|virtual display|virtual usb|chipset|firmware|printer|scanner|bluetooth driver|audio driver|display driver)\b") {
-        $classification = "Driver / system component"
-        $confidence = "Unsupported"
-        $strategy = "do-not-restore"
-        $reasons += "Name or metadata indicates driver/device-level software."
-    } elseif (Test-AppTextMatch -App $App -Pattern "(visual c\+\+.*redistributable|\.net.*(runtime|sdk|desktop runtime)|webview2 runtime|directx|windows sdk)") {
+    $runtimePattern = "(visual c\+\+.*(redistributable|runtime)|\.net.*(runtime|sdk|desktop runtime)|webview2 runtime|directx|windows sdk)"
+    $driverPattern = "\b(driver|virtual display|virtual usb|chipset|firmware|printer driver|scanner driver|bluetooth driver|audio driver|display driver)\b"
+    $securityPattern = "\b(antivirus|endpoint|edr|firewall|vpn|wireguard|openvpn|nordvpn|proton vpn|security agent)\b"
+
+    if (Test-AppEvidenceTextMatch -App $App -Pattern $runtimePattern -Fields @("name", "publisher", "packageId")) {
         $classification = "Unsupported / risky"
         $confidence = "Unsupported"
         $strategy = "do-not-restore"
         $reasons += "Runtime or SDK dependency should be installed by Windows, apps, or package managers as needed."
-    } elseif (Test-AppTextMatch -App $App -Pattern "\b(antivirus|endpoint|edr|firewall|vpn|wireguard|openvpn|nordvpn|proton vpn|security agent)\b") {
+    } elseif (Test-AppEvidenceTextMatch -App $App -Pattern $driverPattern -Fields @("name", "publisher", "packageId")) {
+        $classification = "Driver / system component"
+        $confidence = "Unsupported"
+        $strategy = "do-not-restore"
+        $reasons += "Name or metadata indicates driver/device-level software."
+    } elseif (Test-AppEvidenceTextMatch -App $App -Pattern $securityPattern -Fields @("name", "publisher", "packageId")) {
         $classification = "Unsupported / risky"
         $confidence = "Unsupported"
         $strategy = "do-not-restore"
         $reasons += "Security or network software may include services, drivers, certificates, or policy state."
+    } elseif ($hasSystemComponentEvidence) {
+        $classification = "Unsupported / risky"
+        $confidence = "Unsupported"
+        $strategy = "do-not-restore"
+        $reasons += "Registry marks this entry as a Windows system component."
     } elseif (Test-AppTextMatch -App $App -Pattern "\b(windowsapps|msstore)\b") {
         $classification = "Microsoft Store / UWP"
         $confidence = "Unsupported"
