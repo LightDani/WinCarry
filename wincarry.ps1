@@ -9,7 +9,7 @@ Current implemented scope:
 - Basic logging
 - Dry-run and confirmation helpers
 - Preflight system snapshot
-- Raw app detection scan
+- App detection scan with raw evidence, deduplication, and classification
 #>
 
 [CmdletBinding()]
@@ -1093,6 +1093,650 @@ function New-ScanEvidenceRecord {
     }
 }
 
+function Get-MapValue {
+    param(
+        $Map,
+        [Parameter(Mandatory = $true)]
+        [string]$Key
+    )
+
+    if ($null -eq $Map) {
+        return ""
+    }
+
+    if ($Map -is [System.Collections.IDictionary]) {
+        if ($Map.Contains($Key)) {
+            return $Map[$Key]
+        }
+
+        return ""
+    }
+
+    $property = $Map.PSObject.Properties[$Key]
+    if ($null -ne $property) {
+        return $property.Value
+    }
+
+    return ""
+}
+
+function Add-UniqueValue {
+    param(
+        [object[]]$Values,
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return @($Values)
+    }
+
+    $existing = @($Values | Where-Object { $_ -eq $Value })
+    if ($existing.Count -gt 0) {
+        return @($Values)
+    }
+
+    return @($Values + $Value)
+}
+
+function Normalize-Whitespace {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ""
+    }
+
+    return (($Text.Trim() -replace "\s+", " "))
+}
+
+function Get-NormalizedName {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return ""
+    }
+
+    $normalized = $Name.ToLowerInvariant()
+    $normalized = $normalized -replace "\(.*?\)", " "
+    $normalized = $normalized -replace "\b(x64|x86|64-bit|32-bit|user|machine|en-us|id-id)\b", " "
+    $normalized = $normalized -replace "[^a-z0-9]+", " "
+    return (Normalize-Whitespace -Text $normalized)
+}
+
+function Get-NameTokens {
+    param([string]$Name)
+
+    $normalized = Get-NormalizedName -Name $Name
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return @()
+    }
+
+    $stopWords = @("the", "inc", "llc", "ltd", "corp", "corporation", "company", "co", "microsoft")
+    return @($normalized.Split(" ") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $stopWords -notcontains $_ })
+}
+
+function Test-StrongNameMatch {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    $leftNormalized = Get-NormalizedName -Name $Left
+    $rightNormalized = Get-NormalizedName -Name $Right
+    if ([string]::IsNullOrWhiteSpace($leftNormalized) -or [string]::IsNullOrWhiteSpace($rightNormalized)) {
+        return $false
+    }
+
+    if ($leftNormalized -eq $rightNormalized) {
+        return $true
+    }
+
+    if ($leftNormalized.Length -ge 4 -and $rightNormalized.Length -ge 4) {
+        if ($leftNormalized.Contains($rightNormalized) -or $rightNormalized.Contains($leftNormalized)) {
+            return $true
+        }
+    }
+
+    $leftTokens = @(Get-NameTokens -Name $Left)
+    $rightTokens = @(Get-NameTokens -Name $Right)
+    if ($leftTokens.Count -eq 0 -or $rightTokens.Count -eq 0) {
+        return $false
+    }
+
+    if ($leftTokens.Count -eq 1 -and $rightTokens.Count -eq 1) {
+        return ($leftTokens[0] -eq $rightTokens[0])
+    }
+
+    $smaller = $leftTokens
+    $larger = $rightTokens
+    if ($rightTokens.Count -lt $leftTokens.Count) {
+        $smaller = $rightTokens
+        $larger = $leftTokens
+    }
+
+    if ($smaller.Count -lt 2) {
+        return $false
+    }
+
+    foreach ($token in $smaller) {
+        if ($larger -notcontains $token) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Get-NormalizedPublisher {
+    param([string]$Publisher)
+
+    $normalized = Get-NormalizedName -Name $Publisher
+    $normalized = $normalized -replace "\b(inc|llc|ltd|corp|corporation|company|co)\b", " "
+    return (Normalize-Whitespace -Text $normalized)
+}
+
+function Get-NormalizedPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
+    $normalized = $expanded.Replace("/", "\").TrimEnd("\")
+    return $normalized.ToLowerInvariant()
+}
+
+function Get-ExecutableNameFromPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+
+    try {
+        return ([System.IO.Path]::GetFileNameWithoutExtension($Path)).ToLowerInvariant()
+    } catch {
+        return ""
+    }
+}
+
+function Test-PathRelationship {
+    param(
+        [string]$LeftPath,
+        [string]$RightPath
+    )
+
+    $left = Get-NormalizedPath -Path $LeftPath
+    $right = Get-NormalizedPath -Path $RightPath
+    if ([string]::IsNullOrWhiteSpace($left) -or [string]::IsNullOrWhiteSpace($right)) {
+        return $false
+    }
+
+    if ($left -eq $right) {
+        return $true
+    }
+
+    return ($left.StartsWith($right + "\") -or $right.StartsWith($left + "\"))
+}
+
+function Get-NormalizedPackageId {
+    param([string]$PackageId)
+
+    if ([string]::IsNullOrWhiteSpace($PackageId)) {
+        return ""
+    }
+
+    return (($PackageId.Trim()).ToLowerInvariant())
+}
+
+function Get-ShortHash {
+    param([string]$Text)
+
+    $sha1 = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        $hashBytes = $sha1.ComputeHash($bytes)
+        $hash = (($hashBytes | ForEach-Object { $_.ToString("x2") }) -join "")
+        return $hash.Substring(0, 8)
+    } finally {
+        $sha1.Dispose()
+    }
+}
+
+function New-StableAppId {
+    param(
+        [string]$Name,
+        [string]$Publisher,
+        [string]$PackageId,
+        [string]$RegistryPath
+    )
+
+    $basis = ("{0}|{1}|{2}|{3}" -f $Name, $Publisher, $PackageId, $RegistryPath)
+    $slug = (Get-NormalizedName -Name $Name) -replace "\s+", "-"
+    if ([string]::IsNullOrWhiteSpace($slug)) {
+        $slug = "unknown-app"
+    }
+    if ($slug.Length -gt 48) {
+        $slug = $slug.Substring(0, 48).TrimEnd("-")
+    }
+
+    return ("app-{0}-{1}" -f $slug, (Get-ShortHash -Text $basis))
+}
+
+function Convert-EvidenceToAppCandidate {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Record,
+
+        [Parameter(Mandatory = $true)]
+        [int]$EvidenceIndex
+    )
+
+    $data = $Record.data
+    $candidate = [ordered]@{
+        source = [string]$Record.source
+        evidenceType = [string]$Record.evidenceType
+        evidenceIndex = $EvidenceIndex
+        name = ""
+        publisher = ""
+        version = ""
+        installLocation = ""
+        executablePath = ""
+        workingDirectory = ""
+        packageManager = ""
+        packageId = ""
+        packageSource = ""
+        registryPath = ""
+        systemComponent = ""
+        parentLabel = ""
+        normalizedName = ""
+        normalizedPublisher = ""
+        normalizedInstallLocation = ""
+        normalizedExecutablePath = ""
+        normalizedPackageId = ""
+        executableName = ""
+    }
+
+    switch ([string]$Record.source) {
+        "registry" {
+            $candidate.name = [string](Get-MapValue -Map $data -Key "displayName")
+            $candidate.publisher = [string](Get-MapValue -Map $data -Key "publisher")
+            $candidate.version = [string](Get-MapValue -Map $data -Key "displayVersion")
+            $candidate.installLocation = [string](Get-MapValue -Map $data -Key "installLocation")
+            $candidate.registryPath = [string](Get-MapValue -Map $data -Key "registryPath")
+            $candidate.systemComponent = [string](Get-MapValue -Map $data -Key "systemComponent")
+        }
+        "winget" {
+            $candidate.name = [string](Get-MapValue -Map $data -Key "name")
+            $candidate.version = [string](Get-MapValue -Map $data -Key "version")
+            $candidate.packageManager = "winget"
+            $candidate.packageId = [string](Get-MapValue -Map $data -Key "packageId")
+            $candidate.packageSource = [string](Get-MapValue -Map $data -Key "source")
+        }
+        "chocolatey" {
+            $candidate.name = [string](Get-MapValue -Map $data -Key "packageName")
+            $candidate.version = [string](Get-MapValue -Map $data -Key "version")
+            $candidate.packageManager = "chocolatey"
+            $candidate.packageId = [string](Get-MapValue -Map $data -Key "packageName")
+        }
+        "scoop" {
+            $candidate.name = [string](Get-MapValue -Map $data -Key "name")
+            $candidate.version = [string](Get-MapValue -Map $data -Key "version")
+            $candidate.packageManager = "scoop"
+            $candidate.packageId = [string](Get-MapValue -Map $data -Key "name")
+            $candidate.packageSource = [string](Get-MapValue -Map $data -Key "bucket")
+        }
+        "startMenu" {
+            $candidate.name = [string](Get-MapValue -Map $data -Key "name")
+            $candidate.executablePath = [string](Get-MapValue -Map $data -Key "targetPath")
+            $candidate.workingDirectory = [string](Get-MapValue -Map $data -Key "workingDirectory")
+        }
+        "knownFolder" {
+            $candidate.name = [string](Get-MapValue -Map $data -Key "name")
+            $candidate.installLocation = [string](Get-MapValue -Map $data -Key "path")
+            $candidate.parentLabel = [string](Get-MapValue -Map $data -Key "parentLabel")
+        }
+    }
+
+    $candidate.normalizedName = Get-NormalizedName -Name $candidate.name
+    $candidate.normalizedPublisher = Get-NormalizedPublisher -Publisher $candidate.publisher
+    $candidate.normalizedInstallLocation = Get-NormalizedPath -Path $candidate.installLocation
+    $candidate.normalizedExecutablePath = Get-NormalizedPath -Path $candidate.executablePath
+    $candidate.normalizedPackageId = Get-NormalizedPackageId -PackageId $candidate.packageId
+    $candidate.executableName = Get-ExecutableNameFromPath -Path $candidate.executablePath
+
+    if ([string]::IsNullOrWhiteSpace($candidate.name)) {
+        return $null
+    }
+
+    return $candidate
+}
+
+function New-LogicalAppFromCandidate {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Candidate
+    )
+
+    $id = New-StableAppId -Name $Candidate.name -Publisher $Candidate.publisher -PackageId $Candidate.packageId -RegistryPath $Candidate.registryPath
+    return [ordered]@{
+        id = $id
+        name = [string]$Candidate.name
+        publisher = [string]$Candidate.publisher
+        versionDetected = [string]$Candidate.version
+        installLocation = [string]$Candidate.installLocation
+        executablePath = [string]$Candidate.executablePath
+        sources = @()
+        package = $null
+        packages = @()
+        classification = "Unknown"
+        restoreConfidence = "Unknown"
+        restoreStrategy = "manual-review"
+        reasons = @()
+        warnings = @()
+        evidence = @()
+        evidenceCount = 0
+        identity = [ordered]@{
+            normalizedName = [string]$Candidate.normalizedName
+            normalizedPublisher = [string]$Candidate.normalizedPublisher
+            normalizedInstallLocation = [string]$Candidate.normalizedInstallLocation
+            normalizedExecutablePath = [string]$Candidate.normalizedExecutablePath
+            executableName = [string]$Candidate.executableName
+            registryPath = [string]$Candidate.registryPath
+            systemComponent = [string]$Candidate.systemComponent
+            folderParent = [string]$Candidate.parentLabel
+        }
+    }
+}
+
+function Add-CandidateToLogicalApp {
+    param(
+        [Parameter(Mandatory = $true)]
+        $App,
+
+        [Parameter(Mandatory = $true)]
+        $Candidate
+    )
+
+    $App.sources = Add-UniqueValue -Values $App.sources -Value $Candidate.source
+    $App.evidence += [ordered]@{
+        index = $Candidate.evidenceIndex
+        source = [string]$Candidate.source
+        evidenceType = [string]$Candidate.evidenceType
+        name = [string]$Candidate.name
+    }
+    $App.evidenceCount = $App.evidence.Count
+
+    if ([string]::IsNullOrWhiteSpace($App.publisher) -and -not [string]::IsNullOrWhiteSpace($Candidate.publisher)) {
+        $App.publisher = [string]$Candidate.publisher
+        $App.identity.normalizedPublisher = [string]$Candidate.normalizedPublisher
+    }
+    if ([string]::IsNullOrWhiteSpace($App.versionDetected) -and -not [string]::IsNullOrWhiteSpace($Candidate.version)) {
+        $App.versionDetected = [string]$Candidate.version
+    }
+    if ([string]::IsNullOrWhiteSpace($App.installLocation) -and -not [string]::IsNullOrWhiteSpace($Candidate.installLocation)) {
+        $App.installLocation = [string]$Candidate.installLocation
+        $App.identity.normalizedInstallLocation = [string]$Candidate.normalizedInstallLocation
+    }
+    if ([string]::IsNullOrWhiteSpace($App.executablePath) -and -not [string]::IsNullOrWhiteSpace($Candidate.executablePath)) {
+        $App.executablePath = [string]$Candidate.executablePath
+        $App.identity.normalizedExecutablePath = [string]$Candidate.normalizedExecutablePath
+        $App.identity.executableName = [string]$Candidate.executableName
+    }
+    if ([string]::IsNullOrWhiteSpace($App.identity.registryPath) -and -not [string]::IsNullOrWhiteSpace($Candidate.registryPath)) {
+        $App.identity.registryPath = [string]$Candidate.registryPath
+    }
+    if ([string]::IsNullOrWhiteSpace($App.identity.systemComponent) -and -not [string]::IsNullOrWhiteSpace($Candidate.systemComponent)) {
+        $App.identity.systemComponent = [string]$Candidate.systemComponent
+    }
+    if ([string]::IsNullOrWhiteSpace($App.identity.folderParent) -and -not [string]::IsNullOrWhiteSpace($Candidate.parentLabel)) {
+        $App.identity.folderParent = [string]$Candidate.parentLabel
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Candidate.packageManager) -and -not [string]::IsNullOrWhiteSpace($Candidate.packageId)) {
+        $packageExists = $false
+        foreach ($package in @($App.packages)) {
+            if ($package.manager -eq $Candidate.packageManager -and $package.id -eq $Candidate.packageId) {
+                $packageExists = $true
+                break
+            }
+        }
+
+        if (-not $packageExists) {
+            $App.packages += [ordered]@{
+                manager = [string]$Candidate.packageManager
+                id = [string]$Candidate.packageId
+                version = [string]$Candidate.version
+                source = [string]$Candidate.packageSource
+            }
+        }
+    }
+}
+
+function Find-LogicalAppMatch {
+    param(
+        [object[]]$Apps,
+        [Parameter(Mandatory = $true)]
+        $Candidate
+    )
+
+    $bestApp = $null
+    $bestScore = 0
+
+    foreach ($app in $Apps) {
+        $score = 0
+
+        if (-not [string]::IsNullOrWhiteSpace($Candidate.normalizedPackageId)) {
+            foreach ($package in @($app.packages)) {
+                if ($package.manager -eq $Candidate.packageManager -and (Get-NormalizedPackageId -PackageId $package.id) -eq $Candidate.normalizedPackageId) {
+                    $score = [Math]::Max($score, 100)
+                }
+            }
+        }
+
+        if (Test-PathRelationship -LeftPath $Candidate.installLocation -RightPath $app.installLocation) {
+            $score = [Math]::Max($score, 90)
+        }
+        if (Test-PathRelationship -LeftPath $Candidate.executablePath -RightPath $app.installLocation) {
+            $score = [Math]::Max($score, 90)
+        }
+
+        if (Test-StrongNameMatch -Left $Candidate.name -Right $app.name) {
+            $nameScore = 60
+            if (-not [string]::IsNullOrWhiteSpace($Candidate.normalizedPublisher) -and $Candidate.normalizedPublisher -eq $app.identity.normalizedPublisher) {
+                $nameScore += 20
+            }
+            if (-not [string]::IsNullOrWhiteSpace($Candidate.packageManager) -or @($app.packages).Count -gt 0) {
+                $nameScore += 10
+            }
+            if ($Candidate.source -eq "knownFolder") {
+                $nameScore -= 20
+            }
+
+            $score = [Math]::Max($score, $nameScore)
+        }
+
+        if ($score -gt $bestScore) {
+            $bestScore = $score
+            $bestApp = $app
+        }
+    }
+
+    if ($bestScore -ge 60) {
+        return $bestApp
+    }
+
+    return $null
+}
+
+function Test-AppTextMatch {
+    param(
+        [Parameter(Mandatory = $true)]
+        $App,
+        [Parameter(Mandatory = $true)]
+        [string]$Pattern
+    )
+
+    $text = ((@($App.name, $App.publisher, $App.installLocation, $App.executablePath, (@($App.packages) | ForEach-Object { $_.id })) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join " ").ToLowerInvariant()
+    return ($text -match $Pattern)
+}
+
+function Set-LogicalAppClassification {
+    param(
+        [Parameter(Mandatory = $true)]
+        $App
+    )
+
+    $classification = "Unknown"
+    $confidence = "Unknown"
+    $strategy = "manual-review"
+    $reasons = @()
+    $warnings = @()
+
+    $sources = @($App.sources)
+    $packages = @($App.packages)
+    $hasWinget = (@($packages | Where-Object { $_.manager -eq "winget" }).Count -gt 0)
+    $hasChocolatey = (@($packages | Where-Object { $_.manager -eq "chocolatey" }).Count -gt 0)
+    $hasScoop = (@($packages | Where-Object { $_.manager -eq "scoop" }).Count -gt 0)
+    $isKnownFolderOnly = ($sources.Count -eq 1 -and $sources[0] -eq "knownFolder")
+
+    if ($App.identity.systemComponent -eq "1") {
+        $classification = "Driver / system component"
+        $confidence = "Unsupported"
+        $strategy = "do-not-restore"
+        $reasons += "Registry marks this entry as a Windows system component."
+    } elseif (Test-AppTextMatch -App $App -Pattern "\b(driver|virtual display|virtual usb|chipset|firmware|printer|scanner|bluetooth driver|audio driver|display driver)\b") {
+        $classification = "Driver / system component"
+        $confidence = "Unsupported"
+        $strategy = "do-not-restore"
+        $reasons += "Name or metadata indicates driver/device-level software."
+    } elseif (Test-AppTextMatch -App $App -Pattern "(visual c\+\+.*redistributable|\.net.*(runtime|sdk|desktop runtime)|webview2 runtime|directx|windows sdk)") {
+        $classification = "Unsupported / risky"
+        $confidence = "Unsupported"
+        $strategy = "do-not-restore"
+        $reasons += "Runtime or SDK dependency should be installed by Windows, apps, or package managers as needed."
+    } elseif (Test-AppTextMatch -App $App -Pattern "\b(antivirus|endpoint|edr|firewall|vpn|wireguard|openvpn|nordvpn|proton vpn|security agent)\b") {
+        $classification = "Unsupported / risky"
+        $confidence = "Unsupported"
+        $strategy = "do-not-restore"
+        $reasons += "Security or network software may include services, drivers, certificates, or policy state."
+    } elseif (Test-AppTextMatch -App $App -Pattern "\b(windowsapps|msstore)\b") {
+        $classification = "Microsoft Store / UWP"
+        $confidence = "Unsupported"
+        $strategy = "manual-review"
+        $reasons += "Microsoft Store/UWP app restore is outside the MVP automatic restore scope."
+    } elseif (Test-AppTextMatch -App $App -Pattern "\b(docker desktop|postgresql|mysql|mariadb|sql server|mongodb|redis|vmware|virtualbox|hyper-v|wsl)\b") {
+        $classification = "Service-heavy"
+        $confidence = "Low"
+        $strategy = "manual-review"
+        $reasons += "App likely depends on services, data directories, networking, drivers, or local machine state."
+    } elseif ($hasScoop) {
+        $classification = "Scoop-managed"
+        $confidence = "High"
+        $strategy = "restore-via-scoop"
+        $reasons += "Found Scoop package metadata."
+    } elseif ($App.identity.folderParent -match "WinCarry portable|WinCarry manual apps") {
+        $classification = "Portable / Self-contained"
+        $confidence = "Medium"
+        $strategy = "manual-review"
+        $reasons += "Found app folder under a WinCarry-managed portable/manual location."
+        if ($isKnownFolderOnly) {
+            $warnings += "Folder presence alone is supporting evidence; verify the app manually before restore."
+        }
+    } elseif ($hasWinget) {
+        $classification = "Winget reinstallable"
+        $confidence = "Medium"
+        $strategy = "reinstall-via-package-manager"
+        $reasons += "Found winget package metadata."
+    } elseif ($hasChocolatey) {
+        $classification = "Chocolatey reinstallable"
+        $confidence = "Medium"
+        $strategy = "reinstall-via-package-manager"
+        $reasons += "Found Chocolatey package metadata."
+    } elseif ($sources -contains "registry") {
+        $classification = "Installer-based / manual reinstall"
+        $confidence = "Low"
+        $strategy = "manual-reinstall"
+        $reasons += "Found uninstall registry metadata but no package-manager identity."
+    } else {
+        $classification = "Unknown"
+        $confidence = "Unknown"
+        $strategy = "manual-review"
+        $reasons += "Evidence is not strong enough for an automatic restore strategy."
+    }
+
+    if ($packages.Count -gt 0) {
+        $packageSummary = (($packages | ForEach-Object { "{0}:{1}" -f $_.manager, $_.id }) -join ", ")
+        $reasons += ("Package evidence: {0}." -f $packageSummary)
+    }
+    if ($sources.Count -gt 0) {
+        $reasons += ("Evidence sources: {0}." -f (($sources | Sort-Object) -join ", "))
+    }
+
+    $App.classification = $classification
+    $App.restoreConfidence = $confidence
+    $App.restoreStrategy = $strategy
+    $App.reasons = @($reasons)
+    $App.warnings = @($warnings)
+
+    if ($packages.Count -gt 0) {
+        if ($hasScoop) {
+            $App.package = @($packages | Where-Object { $_.manager -eq "scoop" } | Select-Object -First 1)[0]
+        } elseif ($hasWinget) {
+            $App.package = @($packages | Where-Object { $_.manager -eq "winget" } | Select-Object -First 1)[0]
+        } elseif ($hasChocolatey) {
+            $App.package = @($packages | Where-Object { $_.manager -eq "chocolatey" } | Select-Object -First 1)[0]
+        }
+    }
+}
+
+function New-LogicalAppsFromEvidence {
+    param(
+        [object[]]$Evidence
+    )
+
+    $apps = @()
+    for ($index = 0; $index -lt $Evidence.Count; $index++) {
+        $candidate = Convert-EvidenceToAppCandidate -Record $Evidence[$index] -EvidenceIndex $index
+        if ($null -eq $candidate) {
+            continue
+        }
+
+        $match = Find-LogicalAppMatch -Apps $apps -Candidate $candidate
+        if ($null -eq $match) {
+            $match = New-LogicalAppFromCandidate -Candidate $candidate
+            $apps += $match
+        }
+
+        Add-CandidateToLogicalApp -App $match -Candidate $candidate
+    }
+
+    foreach ($app in $apps) {
+        Set-LogicalAppClassification -App $app
+    }
+
+    return @($apps | Sort-Object -Property @{ Expression = { [string]$_.classification } }, @{ Expression = { [string]$_.name } })
+}
+
+function Get-ClassificationSummary {
+    param([object[]]$Apps)
+
+    $summary = [ordered]@{}
+    foreach ($app in $Apps) {
+        $key = [string]$app.classification
+        if ([string]::IsNullOrWhiteSpace($key)) {
+            $key = "Unknown"
+        }
+
+        if (-not $summary.Contains($key)) {
+            $summary[$key] = 0
+        }
+        $summary[$key] = [int]$summary[$key] + 1
+    }
+
+    return $summary
+}
+
 function Get-RegistryUninstallEvidence {
     $records = @()
     $warnings = @()
@@ -1503,13 +2147,15 @@ function New-AppScanSnapshot {
             exists = (Test-Path -LiteralPath $resolvedRoot)
         }
         notes = @(
-            "This is raw detection evidence only.",
-            "No deduplication, classification, restore confidence, or restore strategy is applied in Phase 3.",
-            "Known-folder records are supporting evidence only and are not proof of installed applications."
+            "Raw detection evidence is preserved for auditability.",
+            "Logical app records are deduplicated and classified using conservative Phase 4 rules.",
+            "Known-folder records remain supporting evidence unless matched with stronger signals."
         )
         sources = [ordered]@{}
         warnings = @()
         evidence = @()
+        apps = @()
+        classificationSummary = [ordered]@{}
     }
 
     Add-ScanSourceResult -Scan $scan -SourceName "registry" -Result (Get-RegistryUninstallEvidence)
@@ -1518,6 +2164,9 @@ function New-AppScanSnapshot {
     Add-ScanSourceResult -Scan $scan -SourceName "scoop" -Result (Get-ScoopEvidence)
     Add-ScanSourceResult -Scan $scan -SourceName "startMenu" -Result (Get-StartMenuShortcutEvidence)
     Add-ScanSourceResult -Scan $scan -SourceName "knownFolder" -Result (Get-KnownFolderEvidence -RootPath $resolvedRoot)
+
+    $scan["apps"] = @(New-LogicalAppsFromEvidence -Evidence $scan.evidence)
+    $scan["classificationSummary"] = Get-ClassificationSummary -Apps $scan.apps
 
     return $scan
 }
@@ -1543,6 +2192,19 @@ function Show-AppScanSummary {
 
     Write-Host ""
     Write-Host ("Total evidence records: {0}" -f $Scan.evidence.Count)
+
+    if ($null -ne $Scan.apps) {
+        Write-Host ""
+        Write-Host ("Logical apps: {0}" -f $Scan.apps.Count)
+
+        if ($null -ne $Scan.classificationSummary -and $Scan.classificationSummary.Count -gt 0) {
+            Write-Host ""
+            Write-Host "Classifications"
+            foreach ($classification in $Scan.classificationSummary.Keys) {
+                Write-Host ("- {0}: {1}" -f $classification, $Scan.classificationSummary[$classification])
+            }
+        }
+    }
 
     if ($Scan.warnings.Count -gt 0) {
         Write-Host ""
@@ -1601,7 +2263,7 @@ function Invoke-Scan {
 
     $reportDirectory = Split-Path -Parent $scanPath
     if (Test-Path -LiteralPath $reportDirectory) {
-        $scanJson = $scan | ConvertTo-Json -Depth 12
+        $scanJson = $scan | ConvertTo-Json -Depth 16
         Set-Content -LiteralPath $scanPath -Value $scanJson -Encoding UTF8
         Write-Info ("Raw scan written: {0}" -f $scanPath)
     } else {
@@ -1611,7 +2273,8 @@ function Invoke-Scan {
     $logDirectory = Split-Path -Parent $logPath
     if (Test-Path -LiteralPath $logDirectory) {
         $sourceSummary = (($scan.sources.Keys | ForEach-Object { "{0}:{1}" -f $_, $scan.sources[$_].count }) -join ",")
-        $message = "Raw app scan completed for root {0}; evidence={1}; sources={2}" -f $scan.root.resolvedRoot, $scan.evidence.Count, $sourceSummary
+        $classificationSummary = (($scan.classificationSummary.Keys | ForEach-Object { "{0}:{1}" -f $_, $scan.classificationSummary[$_] }) -join ",")
+        $message = "App scan completed for root {0}; evidence={1}; apps={2}; sources={3}; classifications={4}" -f $scan.root.resolvedRoot, $scan.evidence.Count, $scan.apps.Count, $sourceSummary, $classificationSummary
         Write-WinCarryLog -RootPath $scan.root.resolvedRoot -Operation "scan" -Result "success" -Message $message
         Write-Info ("Log updated: {0}" -f $logPath)
     } else {
@@ -1737,7 +2400,7 @@ function Show-Help {
     Write-Host "  .\wincarry.ps1 offline"
     Write-Host "  .\wincarry.ps1 junction"
     Write-Host ""
-    Write-Host "Implemented: CLI shell, setup, preflight system snapshot, and raw app detection scan."
+    Write-Host "Implemented: CLI shell, setup, preflight system snapshot, and app detection with classification."
     Write-Host "Later-phase commands currently show placeholders and make no changes."
 }
 
