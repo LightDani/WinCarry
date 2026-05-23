@@ -850,20 +850,22 @@ function Convert-FixedWidthTable {
     foreach ($columnName in $ColumnNames) {
         $start = $header.IndexOf($columnName, [StringComparison]::OrdinalIgnoreCase)
         if ($start -ge 0) {
-            $columns += [ordered]@{
+            $columns += [pscustomobject]@{
                 name = $columnName
-                start = $start
+                start = [int]$start
                 end = $null
             }
         }
     }
 
-    $columns = @($columns | Sort-Object -Property start)
+    $columns = @($columns | Sort-Object -Property @{ Expression = { [int]$_.start } }, @{ Expression = { [string]$_.name } })
     for ($index = 0; $index -lt $columns.Count; $index++) {
-        if ($index -lt ($columns.Count - 1)) {
-            $columns[$index].end = $columns[$index + 1].start
-        } else {
-            $columns[$index].end = $null
+        $columns[$index].end = $null
+        for ($nextIndex = $index + 1; $nextIndex -lt $columns.Count; $nextIndex++) {
+            if ([int]$columns[$nextIndex].start -gt [int]$columns[$index].start) {
+                $columns[$index].end = [int]$columns[$nextIndex].start
+                break
+            }
         }
     }
 
@@ -887,14 +889,23 @@ function Convert-FixedWidthTable {
 
         $row = [ordered]@{}
         foreach ($column in $columns) {
-            if ($line.Length -le $column.start) {
+            $columnStart = [int]$column.start
+            $columnEnd = $column.end
+
+            if ($columnStart -lt 0 -or $line.Length -le $columnStart) {
                 $value = ""
             } else {
-                if ($null -ne $column.end -and $line.Length -gt $column.end) {
-                    $length = $column.end - $column.start
-                    $value = $line.Substring($column.start, $length).Trim()
+                if ($null -ne $columnEnd -and [int]$columnEnd -gt $columnStart) {
+                    $safeEnd = [Math]::Min([int]$columnEnd, [int]$line.Length)
+                    $length = $safeEnd - $columnStart
                 } else {
-                    $value = $line.Substring($column.start).Trim()
+                    $length = 0
+                }
+
+                if ($length -gt 0) {
+                    $value = $line.Substring($columnStart, $length).Trim()
+                } else {
+                    $value = $line.Substring($columnStart).Trim()
                 }
             }
 
