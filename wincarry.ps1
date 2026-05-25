@@ -11,6 +11,7 @@ Current implemented scope:
 - Preflight system snapshot
 - App detection scan with raw evidence, deduplication, and classification
 - Manifest and report generation
+- Config detection and safe backup
 #>
 
 [CmdletBinding()]
@@ -264,6 +265,49 @@ function Get-ManifestArtifactPaths {
         manualReinstallList = (Get-ManualReinstallListPath -RootPath $RootPath -Timestamp $Timestamp)
         unsupportedList = (Get-UnsupportedListPath -RootPath $RootPath -Timestamp $Timestamp)
     }
+}
+
+function Get-ConfigBackupRootPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Timestamp
+    )
+
+    return (Join-Path (Join-Path $RootPath "backups") $Timestamp)
+}
+
+function Get-ConfigBackupMetadataPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BackupRootPath
+    )
+
+    return (Join-Path $BackupRootPath "config-backup.json")
+}
+
+function Get-LatestConfigBackupMetadataPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath
+    )
+
+    return (Join-Path (Join-Path $RootPath "backups") "latest-config-backup.json")
+}
+
+function Get-ConfigBackupReportPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Timestamp
+    )
+
+    $reportFileName = "backup-{0}.md" -f $Timestamp
+    return (Join-Path (Join-Path $RootPath "reports") $reportFileName)
 }
 
 function Write-WinCarryLog {
@@ -1885,6 +1929,18 @@ function ConvertTo-ArrayValue {
         return @()
     }
 
+    if ($Value -is [System.Collections.IDictionary]) {
+        return @($Value)
+    }
+
+    if ($Value -is [string]) {
+        if ([string]::IsNullOrWhiteSpace($Value)) {
+            return @()
+        }
+
+        return @($Value)
+    }
+
     return @($Value | Where-Object { $null -ne $_ -and -not ($_ -is [string] -and [string]::IsNullOrWhiteSpace($_)) })
 }
 
@@ -2098,7 +2154,7 @@ function New-AppManifestFromScan {
     $manualApps = @(Get-ManualReinstallApps -Apps $apps | ForEach-Object { New-AppSummaryRecord -App $_ })
     $unsupportedApps = @(Get-UnsupportedApps -Apps $apps | ForEach-Object { New-AppSummaryRecord -App $_ })
 
-    return [ordered]@{
+    $manifest = [ordered]@{
         schemaVersion = "1.0"
         createdAt = (Get-Date).ToString("o")
         toolName = $script:ToolName
@@ -2136,6 +2192,9 @@ function New-AppManifestFromScan {
         manualReinstall = @($manualApps)
         unsupported = @($unsupportedApps)
     }
+
+    Merge-LatestConfigBackupIntoManifest -Manifest $manifest -RootPath $rootPath | Out-Null
+    return $manifest
 }
 
 function ConvertTo-MarkdownCell {
@@ -2401,6 +2460,638 @@ function Convert-AppSummaryListToText {
     }
 
     return ($lines -join [Environment]::NewLine)
+}
+
+function Resolve-ConfigPathTemplate {
+    param([string]$Template)
+
+    if ([string]::IsNullOrWhiteSpace($Template)) {
+        return ""
+    }
+
+    $userProfile = $env:USERPROFILE
+    if ([string]::IsNullOrWhiteSpace($userProfile)) {
+        $userProfile = $env:HOME
+    }
+
+    $replacements = [ordered]@{
+        "%USERPROFILE%" = $userProfile
+        "%APPDATA%" = $env:APPDATA
+        "%LOCALAPPDATA%" = $env:LOCALAPPDATA
+        "%PROGRAMDATA%" = $env:PROGRAMDATA
+    }
+
+    $resolved = $Template
+    foreach ($key in $replacements.Keys) {
+        $value = [string]$replacements[$key]
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $resolved = $resolved.Replace($key, $value)
+        }
+    }
+
+    if (-not (Test-IsWindows)) {
+        $resolved = $resolved.Replace("\", [string][System.IO.Path]::DirectorySeparatorChar)
+    }
+
+    return (Resolve-DisplayPath -Path $resolved)
+}
+
+function Get-SafeFileName {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return "config"
+    }
+
+    $safe = $Name.ToLowerInvariant() -replace "[^a-z0-9]+", "-"
+    $safe = $safe.Trim("-")
+    if ([string]::IsNullOrWhiteSpace($safe)) {
+        return "config"
+    }
+    if ($safe.Length -gt 64) {
+        $safe = $safe.Substring(0, 64).TrimEnd("-")
+    }
+    return $safe
+}
+
+function New-ConfigDefinition {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("safe", "sensitive", "detect-only")]
+        [string]$Type,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$AppName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PathTemplate,
+
+        [string]$RestorePathTemplate = "",
+        [string]$AppNamePattern = "",
+        [string]$BackupSlug = "",
+        [string[]]$Warnings = @()
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RestorePathTemplate)) {
+        $RestorePathTemplate = $PathTemplate
+    }
+    if ([string]::IsNullOrWhiteSpace($AppNamePattern)) {
+        $AppNamePattern = [regex]::Escape($AppName)
+    }
+    if ([string]::IsNullOrWhiteSpace($BackupSlug)) {
+        $BackupSlug = Get-SafeFileName -Name $Name
+    }
+
+    return [ordered]@{
+        type = $Type
+        name = $Name
+        appName = $AppName
+        appNamePattern = $AppNamePattern
+        pathTemplate = $PathTemplate
+        restorePathTemplate = $RestorePathTemplate
+        backupSlug = $BackupSlug
+        warnings = @($Warnings)
+    }
+}
+
+function Convert-ConfigDefinitionToCandidate {
+    param($Definition)
+
+    $pathTemplate = [string](Get-MapValue -Map $Definition -Key "pathTemplate")
+    $resolvedPath = Resolve-ConfigPathTemplate -Template $pathTemplate
+    if ([string]::IsNullOrWhiteSpace($resolvedPath) -or -not (Test-Path -LiteralPath $resolvedPath)) {
+        return $null
+    }
+
+    $item = Get-Item -LiteralPath $resolvedPath -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) {
+        return $null
+    }
+
+    return [ordered]@{
+        type = [string](Get-MapValue -Map $Definition -Key "type")
+        name = [string](Get-MapValue -Map $Definition -Key "name")
+        appName = [string](Get-MapValue -Map $Definition -Key "appName")
+        appNamePattern = [string](Get-MapValue -Map $Definition -Key "appNamePattern")
+        originalPath = $item.FullName
+        restorePathTemplate = [string](Get-MapValue -Map $Definition -Key "restorePathTemplate")
+        backupSlug = [string](Get-MapValue -Map $Definition -Key "backupSlug")
+        isDirectory = [bool]$item.PSIsContainer
+        warnings = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Definition -Key "warnings"))
+    }
+}
+
+function Get-ConfigDefinitions {
+    $definitions = @()
+
+    $definitions += New-ConfigDefinition -Type "safe" -Name "VS Code User Settings" -AppName "Visual Studio Code" -AppNamePattern "visual studio code|vs code|code" -PathTemplate "%APPDATA%\Code\User" -BackupSlug "vscode-user"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "VS Code Insiders User Settings" -AppName "Visual Studio Code" -AppNamePattern "visual studio code|vs code|code" -PathTemplate "%APPDATA%\Code - Insiders\User" -BackupSlug "vscode-insiders-user"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "VSCodium User Settings" -AppName "VSCodium" -AppNamePattern "vscodium" -PathTemplate "%APPDATA%\VSCodium\User" -BackupSlug "vscodium-user"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "Git global config" -AppName "Git" -AppNamePattern "\bgit\b" -PathTemplate "%USERPROFILE%\.gitconfig" -BackupSlug "gitconfig"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "Git global ignore" -AppName "Git" -AppNamePattern "\bgit\b" -PathTemplate "%USERPROFILE%\.gitignore_global" -BackupSlug "gitignore-global"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "Windows Terminal settings" -AppName "Windows Terminal" -AppNamePattern "windows terminal" -PathTemplate "%LOCALAPPDATA%\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json" -BackupSlug "windows-terminal-settings"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "Windows Terminal Preview settings" -AppName "Windows Terminal" -AppNamePattern "windows terminal" -PathTemplate "%LOCALAPPDATA%\Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json" -BackupSlug "windows-terminal-preview-settings"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "PowerShell WindowsPowerShell current-user profile" -AppName "PowerShell" -AppNamePattern "powershell" -PathTemplate "%USERPROFILE%\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1" -BackupSlug "powershell-windows-profile"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "PowerShell WindowsPowerShell all-hosts profile" -AppName "PowerShell" -AppNamePattern "powershell" -PathTemplate "%USERPROFILE%\Documents\WindowsPowerShell\profile.ps1" -BackupSlug "powershell-windows-allhosts-profile"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "PowerShell 7 current-user profile" -AppName "PowerShell" -AppNamePattern "powershell" -PathTemplate "%USERPROFILE%\Documents\PowerShell\Microsoft.PowerShell_profile.ps1" -BackupSlug "powershell-7-profile"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "PowerShell 7 all-hosts profile" -AppName "PowerShell" -AppNamePattern "powershell" -PathTemplate "%USERPROFILE%\Documents\PowerShell\profile.ps1" -BackupSlug "powershell-7-allhosts-profile"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "npm global config folder" -AppName "Node.js" -AppNamePattern "node|npm" -PathTemplate "%APPDATA%\npm\etc" -BackupSlug "npm-etc" -Warnings @("Files named npmrc are treated as sensitive if copied from user profile; review npm tokens before restore.")
+    $definitions += New-ConfigDefinition -Type "safe" -Name "pnpm config" -AppName "pnpm" -AppNamePattern "pnpm|node" -PathTemplate "%LOCALAPPDATA%\pnpm\config" -BackupSlug "pnpm-config"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "pnpm roaming config" -AppName "pnpm" -AppNamePattern "pnpm|node" -PathTemplate "%APPDATA%\pnpm\config" -BackupSlug "pnpm-roaming-config"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "Yarn config" -AppName "Yarn" -AppNamePattern "yarn|node" -PathTemplate "%LOCALAPPDATA%\Yarn\Config" -BackupSlug "yarn-config"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "Yarn rc" -AppName "Yarn" -AppNamePattern "yarn|node" -PathTemplate "%USERPROFILE%\.yarnrc" -BackupSlug "yarnrc"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "Yarn Berry rc" -AppName "Yarn" -AppNamePattern "yarn|node" -PathTemplate "%USERPROFILE%\.yarnrc.yml" -BackupSlug "yarnrc-yml"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "Python pip user config" -AppName "Python" -AppNamePattern "python|pip" -PathTemplate "%APPDATA%\pip\pip.ini" -BackupSlug "pip-user-config"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "Python pip home config" -AppName "Python" -AppNamePattern "python|pip" -PathTemplate "%USERPROFILE%\pip\pip.ini" -BackupSlug "pip-home-config"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "SSH client config" -AppName "OpenSSH" -AppNamePattern "ssh|openssh|git" -PathTemplate "%USERPROFILE%\.ssh\config" -BackupSlug "ssh-config" -Warnings @("SSH host aliases may reveal server names. Private keys are handled separately as sensitive files.")
+    $definitions += New-ConfigDefinition -Type "safe" -Name "SSH known hosts" -AppName "OpenSSH" -AppNamePattern "ssh|openssh|git" -PathTemplate "%USERPROFILE%\.ssh\known_hosts" -BackupSlug "ssh-known-hosts" -Warnings @("Known hosts can reveal server names.")
+
+    $definitions += New-ConfigDefinition -Type "sensitive" -Name "npm user config" -AppName "Node.js" -AppNamePattern "node|npm" -PathTemplate "%USERPROFILE%\.npmrc" -BackupSlug "npmrc" -Warnings @(".npmrc can contain package registry tokens. Skipped by default.")
+    $definitions += New-ConfigDefinition -Type "sensitive" -Name "Docker client config" -AppName "Docker Desktop" -AppNamePattern "docker" -PathTemplate "%USERPROFILE%\.docker\config.json" -BackupSlug "docker-config" -Warnings @("Docker config can contain registry credentials. Skipped by default.")
+    $definitions += New-ConfigDefinition -Type "sensitive" -Name "Home .env" -AppName "Shell" -AppNamePattern "shell|powershell" -PathTemplate "%USERPROFILE%\.env" -BackupSlug "home-env" -Warnings @(".env files commonly contain secrets. Skipped by default.")
+
+    $definitions += New-ConfigDefinition -Type "detect-only" -Name "Google Chrome profile" -AppName "Google Chrome" -AppNamePattern "chrome" -PathTemplate "%LOCALAPPDATA%\Google\Chrome\User Data" -BackupSlug "chrome-profile" -Warnings @("Browser profiles can include cookies, sessions, passwords, and tokens. Detect-only in MVP.")
+    $definitions += New-ConfigDefinition -Type "detect-only" -Name "Microsoft Edge profile" -AppName "Microsoft Edge" -AppNamePattern "edge" -PathTemplate "%LOCALAPPDATA%\Microsoft\Edge\User Data" -BackupSlug "edge-profile" -Warnings @("Browser profiles can include cookies, sessions, passwords, and tokens. Detect-only in MVP.")
+    $definitions += New-ConfigDefinition -Type "detect-only" -Name "Mozilla Firefox profiles" -AppName "Mozilla Firefox" -AppNamePattern "firefox|mozilla" -PathTemplate "%APPDATA%\Mozilla\Firefox\Profiles" -BackupSlug "firefox-profiles" -Warnings @("Browser profiles can include cookies, sessions, passwords, and tokens. Detect-only in MVP.")
+    $definitions += New-ConfigDefinition -Type "detect-only" -Name "Discord profile" -AppName "Discord" -AppNamePattern "discord" -PathTemplate "%APPDATA%\discord" -BackupSlug "discord-profile" -Warnings @("Chat app profiles can include sessions and tokens. Detect-only in MVP.")
+    $definitions += New-ConfigDefinition -Type "detect-only" -Name "Slack profile" -AppName "Slack" -AppNamePattern "slack" -PathTemplate "%APPDATA%\Slack" -BackupSlug "slack-profile" -Warnings @("Chat app profiles can include sessions and tokens. Detect-only in MVP.")
+    $definitions += New-ConfigDefinition -Type "detect-only" -Name "Microsoft Teams profile" -AppName "Microsoft Teams" -AppNamePattern "teams" -PathTemplate "%APPDATA%\Microsoft\Teams" -BackupSlug "teams-profile" -Warnings @("Chat app profiles can include sessions and tokens. Detect-only in MVP.")
+    $definitions += New-ConfigDefinition -Type "detect-only" -Name "Telegram Desktop profile" -AppName "Telegram Desktop" -AppNamePattern "telegram" -PathTemplate "%APPDATA%\Telegram Desktop" -BackupSlug "telegram-profile" -Warnings @("Chat app profiles can include sessions and tokens. Detect-only in MVP.")
+
+    return @($definitions)
+}
+
+function Get-DiscoveredConfigCandidates {
+    $candidates = @()
+    foreach ($definition in (Get-ConfigDefinitions)) {
+        $candidate = Convert-ConfigDefinitionToCandidate -Definition $definition
+        if ($null -ne $candidate) {
+            $candidates += $candidate
+        }
+    }
+
+    $sshRoot = Resolve-ConfigPathTemplate -Template "%USERPROFILE%\.ssh"
+    if (-not [string]::IsNullOrWhiteSpace($sshRoot) -and (Test-Path -LiteralPath $sshRoot)) {
+        $privateKeyNames = @("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
+        foreach ($name in $privateKeyNames) {
+            $path = Join-Path $sshRoot $name
+            if (Test-Path -LiteralPath $path) {
+                $candidates += [ordered]@{
+                    type = "sensitive"
+                    name = ("SSH private key: {0}" -f $name)
+                    appName = "OpenSSH"
+                    appNamePattern = "ssh|openssh|git"
+                    originalPath = (Resolve-DisplayPath -Path $path)
+                    restorePathTemplate = ("%USERPROFILE%\.ssh\{0}" -f $name)
+                    backupSlug = ("ssh-private-key-{0}" -f $name)
+                    isDirectory = $false
+                    warnings = @("SSH private keys grant access to remote systems. Skipped by default.")
+                }
+            }
+        }
+    }
+
+    $userProfile = Resolve-ConfigPathTemplate -Template "%USERPROFILE%"
+    if (-not [string]::IsNullOrWhiteSpace($userProfile) -and (Test-Path -LiteralPath $userProfile)) {
+        foreach ($envFile in @(Get-ChildItem -LiteralPath $userProfile -Force -File -Filter ".env*" -ErrorAction SilentlyContinue)) {
+            if ($envFile.Name -eq ".env" -or $envFile.Name.StartsWith(".env.")) {
+                $candidates += [ordered]@{
+                    type = "sensitive"
+                    name = ("Environment file: {0}" -f $envFile.Name)
+                    appName = "Shell"
+                    appNamePattern = "shell|powershell"
+                    originalPath = $envFile.FullName
+                    restorePathTemplate = ("%USERPROFILE%\{0}" -f $envFile.Name)
+                    backupSlug = ("env-{0}" -f (Get-SafeFileName -Name $envFile.Name))
+                    isDirectory = $false
+                    warnings = @("Environment files commonly contain secrets. Skipped by default.")
+                }
+            }
+        }
+    }
+
+    return @($candidates)
+}
+
+function Test-ExcludedConfigPath {
+    param([string]$RelativePath)
+
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) {
+        return $false
+    }
+
+    $segments = @($RelativePath -split "[\\/]+")
+    foreach ($segment in $segments) {
+        $name = $segment.ToLowerInvariant()
+        if ($name -match "^(cache|caches|code cache|gpucache|gpu cache|logs?|temp|tmp|crashpad|crashes|crash dumps|node_modules)$") {
+            return $true
+        }
+    }
+
+    $leaf = ([System.IO.Path]::GetFileName($RelativePath)).ToLowerInvariant()
+    return ($leaf -match "\.(log|tmp|cache)$")
+}
+
+function Test-SensitiveConfigPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    $normalized = (Get-NormalizedPath -Path $Path)
+    $leaf = ([System.IO.Path]::GetFileName($Path)).ToLowerInvariant()
+    if ($leaf -eq ".npmrc") { return $true }
+    if ($leaf -eq ".env" -or $leaf.StartsWith(".env.")) { return $true }
+    if ($leaf -match "^(id_rsa|id_dsa|id_ecdsa|id_ed25519)$") { return $true }
+    if ($leaf -match "\.(pem|key|pfx|p12)$") { return $true }
+    if ($normalized -match "[\\/]\.docker[\\/]config\.json$") { return $true }
+
+    return $false
+}
+
+function Copy-ConfigCandidate {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Candidate,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigsRootPath,
+
+        [switch]$IncludeSensitive
+    )
+
+    $source = [string](Get-MapValue -Map $Candidate -Key "originalPath")
+    $slug = [string](Get-MapValue -Map $Candidate -Key "backupSlug")
+    if ([string]::IsNullOrWhiteSpace($slug)) {
+        $slug = Get-SafeFileName -Name ([string](Get-MapValue -Map $Candidate -Key "name"))
+    }
+    $destinationRoot = Join-Path $ConfigsRootPath $slug
+    $copied = 0
+    $skipped = 0
+    $skippedSensitive = 0
+
+    try {
+        $item = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+        if ($item.PSIsContainer) {
+            if (-not (Test-Path -LiteralPath $destinationRoot)) {
+                New-Item -ItemType Directory -Path $destinationRoot -Force | Out-Null
+            }
+
+            $sourceRoot = ([System.IO.Path]::GetFullPath($item.FullName)).TrimEnd("\", "/")
+            foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force -Recurse -ErrorAction SilentlyContinue)) {
+                $childFullPath = [System.IO.Path]::GetFullPath($child.FullName)
+                $relative = $childFullPath.Substring($sourceRoot.Length).TrimStart([char[]]@("\", "/"))
+                if (Test-ExcludedConfigPath -RelativePath $relative) {
+                    $skipped++
+                    continue
+                }
+                if (-not $child.PSIsContainer -and (Test-SensitiveConfigPath -Path $child.FullName) -and -not $IncludeSensitive) {
+                    $skippedSensitive++
+                    continue
+                }
+
+                $destination = Join-Path $destinationRoot $relative
+                if ($child.PSIsContainer) {
+                    if (-not (Test-Path -LiteralPath $destination)) {
+                        New-Item -ItemType Directory -Path $destination -Force | Out-Null
+                    }
+                } else {
+                    $destinationParent = Split-Path -Parent $destination
+                    if (-not (Test-Path -LiteralPath $destinationParent)) {
+                        New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
+                    }
+                    Copy-Item -LiteralPath $child.FullName -Destination $destination -Force
+                    $copied++
+                }
+            }
+        } else {
+            if ((Test-SensitiveConfigPath -Path $item.FullName) -and -not $IncludeSensitive) {
+                $skippedSensitive++
+                return [ordered]@{
+                    backupPath = ""
+                    backupStatus = "skipped_sensitive"
+                    copiedFiles = 0
+                    skippedFiles = 0
+                    skippedSensitiveFiles = $skippedSensitive
+                    error = ""
+                }
+            }
+
+            if (-not (Test-Path -LiteralPath $destinationRoot)) {
+                New-Item -ItemType Directory -Path $destinationRoot -Force | Out-Null
+            }
+            $destination = Join-Path $destinationRoot $item.Name
+            Copy-Item -LiteralPath $item.FullName -Destination $destination -Force
+            $copied++
+        }
+
+        return [ordered]@{
+            backupPath = $destinationRoot
+            backupStatus = "backed_up"
+            copiedFiles = $copied
+            skippedFiles = $skipped
+            skippedSensitiveFiles = $skippedSensitive
+            error = ""
+        }
+    } catch {
+        return [ordered]@{
+            backupPath = ""
+            backupStatus = "failed"
+            copiedFiles = $copied
+            skippedFiles = $skipped
+            skippedSensitiveFiles = $skippedSensitive
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function New-ConfigBackupRecord {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Candidate,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Status,
+
+        [string]$BackupPath = "",
+        [int]$CopiedFiles = 0,
+        [int]$SkippedFiles = 0,
+        [int]$SkippedSensitiveFiles = 0,
+        [string]$ErrorMessage = ""
+    )
+
+    return [ordered]@{
+        type = [string](Get-MapValue -Map $Candidate -Key "type")
+        name = [string](Get-MapValue -Map $Candidate -Key "name")
+        appName = [string](Get-MapValue -Map $Candidate -Key "appName")
+        appNamePattern = [string](Get-MapValue -Map $Candidate -Key "appNamePattern")
+        originalPath = [string](Get-MapValue -Map $Candidate -Key "originalPath")
+        restorePathTemplate = [string](Get-MapValue -Map $Candidate -Key "restorePathTemplate")
+        backupPath = $BackupPath
+        backupStatus = $Status
+        copiedFiles = $CopiedFiles
+        skippedFiles = $SkippedFiles
+        skippedSensitiveFiles = $SkippedSensitiveFiles
+        error = $ErrorMessage
+        warnings = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Candidate -Key "warnings"))
+    }
+}
+
+function New-ConfigBackupMetadata {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BackupRootPath,
+
+        [Parameter(Mandatory = $true)]
+        [object[]]$ConfigRecords,
+
+        [Parameter(Mandatory = $true)]
+        [object[]]$DetectOnlyRecords,
+
+        [bool]$IncludeSensitive
+    )
+
+    return [ordered]@{
+        schemaVersion = "config-backup.1"
+        createdAt = (Get-Date).ToString("o")
+        toolName = $script:ToolName
+        root = [ordered]@{
+            winCarryRoot = $RootPath
+        }
+        backupRoot = $BackupRootPath
+        includeSensitive = $IncludeSensitive
+        exclusions = @("cache", "logs", "temp", "tmp", "crash", "node_modules", "*.log", "*.tmp", "*.cache")
+        configs = @($ConfigRecords)
+        detectOnly = @($DetectOnlyRecords)
+        summary = [ordered]@{
+            backedUp = @($ConfigRecords | Where-Object { $_.backupStatus -eq "backed_up" }).Count
+            skippedSensitive = @($ConfigRecords | Where-Object { $_.backupStatus -eq "skipped_sensitive" }).Count
+            failed = @($ConfigRecords | Where-Object { $_.backupStatus -eq "failed" }).Count
+            detectOnly = @($DetectOnlyRecords).Count
+        }
+    }
+}
+
+function Convert-ConfigBackupReportToMarkdown {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Metadata
+    )
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $summary = Get-MapValue -Map $Metadata -Key "summary"
+    $configs = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Metadata -Key "configs"))
+    $detectOnly = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Metadata -Key "detectOnly"))
+
+    $lines.Add("# WinCarry Config Backup Report")
+    $lines.Add("")
+    $lines.Add(("Created: {0}" -f (Get-MapValue -Map $Metadata -Key "createdAt")))
+    $lines.Add(("Backup root: {0}" -f (Get-MapValue -Map $Metadata -Key "backupRoot")))
+    $lines.Add(("Included sensitive configs: {0}" -f (Get-MapValue -Map $Metadata -Key "includeSensitive")))
+    $lines.Add("")
+    $lines.Add("## Summary")
+    $lines.Add("")
+    $lines.Add(("- Backed up: {0}" -f (Get-MapValue -Map $summary -Key "backedUp")))
+    $lines.Add(("- Skipped sensitive: {0}" -f (Get-MapValue -Map $summary -Key "skippedSensitive")))
+    $lines.Add(("- Failed: {0}" -f (Get-MapValue -Map $summary -Key "failed")))
+    $lines.Add(("- Detect-only: {0}" -f (Get-MapValue -Map $summary -Key "detectOnly")))
+    $lines.Add("")
+    $lines.Add("## Backups")
+    $lines.Add("")
+    if ($configs.Count -eq 0) {
+        $lines.Add("No config candidates were found.")
+    } else {
+        foreach ($record in $configs) {
+            $lines.Add(("- {0}: {1}" -f (Get-MapValue -Map $record -Key "name"), (Get-MapValue -Map $record -Key "backupStatus")))
+            $lines.Add(("  Original: {0}" -f (Get-MapValue -Map $record -Key "originalPath")))
+            $backupPath = [string](Get-MapValue -Map $record -Key "backupPath")
+            if (-not [string]::IsNullOrWhiteSpace($backupPath)) {
+                $lines.Add(("  Backup: {0}" -f $backupPath))
+            }
+            $lines.Add(("  Restore template: {0}" -f (Get-MapValue -Map $record -Key "restorePathTemplate")))
+            $warnings = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $record -Key "warnings"))
+            foreach ($warning in $warnings) {
+                $lines.Add(("  Warning: {0}" -f $warning))
+            }
+            $errorText = [string](Get-MapValue -Map $record -Key "error")
+            if (-not [string]::IsNullOrWhiteSpace($errorText)) {
+                $lines.Add(("  Error: {0}" -f $errorText))
+            }
+        }
+    }
+    $lines.Add("")
+    $lines.Add("## Detect Only")
+    $lines.Add("")
+    if ($detectOnly.Count -eq 0) {
+        $lines.Add("No detect-only profiles were found.")
+    } else {
+        foreach ($record in $detectOnly) {
+            $lines.Add(("- {0}: {1}" -f (Get-MapValue -Map $record -Key "name"), (Get-MapValue -Map $record -Key "originalPath")))
+            foreach ($warning in (ConvertTo-ArrayValue -Value (Get-MapValue -Map $record -Key "warnings"))) {
+                $lines.Add(("  Warning: {0}" -f $warning))
+            }
+        }
+    }
+
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Add-PropertyIfMissing {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Object,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        $Value
+    )
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        if (-not $Object.Contains($Name)) {
+            $Object[$Name] = $Value
+        }
+        return
+    }
+
+    if ($null -eq $Object.PSObject.Properties[$Name]) {
+        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+    }
+}
+
+function Find-ManifestAppForConfigRecord {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Manifest,
+
+        [Parameter(Mandatory = $true)]
+        $Record
+    )
+
+    $pattern = [string](Get-MapValue -Map $Record -Key "appNamePattern")
+    if ([string]::IsNullOrWhiteSpace($pattern)) {
+        $pattern = [regex]::Escape([string](Get-MapValue -Map $Record -Key "appName"))
+    }
+
+    foreach ($app in @(Get-MapValue -Map $Manifest -Key "apps")) {
+        $name = [string](Get-MapValue -Map $app -Key "name")
+        if (-not [string]::IsNullOrWhiteSpace($name) -and $name.ToLowerInvariant() -match $pattern.ToLowerInvariant()) {
+            return $app
+        }
+    }
+
+    return $null
+}
+
+function New-ManifestConfigPathRecord {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Record
+    )
+
+    return [ordered]@{
+        type = [string](Get-MapValue -Map $Record -Key "type")
+        name = [string](Get-MapValue -Map $Record -Key "name")
+        originalPath = [string](Get-MapValue -Map $Record -Key "originalPath")
+        restorePathTemplate = [string](Get-MapValue -Map $Record -Key "restorePathTemplate")
+        backupPath = [string](Get-MapValue -Map $Record -Key "backupPath")
+        backupStatus = [string](Get-MapValue -Map $Record -Key "backupStatus")
+        warnings = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Record -Key "warnings"))
+    }
+}
+
+function Add-ConfigPathToApp {
+    param(
+        [Parameter(Mandatory = $true)]
+        $App,
+
+        [Parameter(Mandatory = $true)]
+        $ConfigPath
+    )
+
+    Add-PropertyIfMissing -Object $App -Name "configPaths" -Value @()
+    $existing = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $App -Key "configPaths"))
+    $originalPath = [string](Get-MapValue -Map $ConfigPath -Key "originalPath")
+    $name = [string](Get-MapValue -Map $ConfigPath -Key "name")
+    $exists = $false
+    foreach ($item in $existing) {
+        if ([string](Get-MapValue -Map $item -Key "originalPath") -eq $originalPath -and [string](Get-MapValue -Map $item -Key "name") -eq $name) {
+            $exists = $true
+            break
+        }
+    }
+
+    if (-not $exists) {
+        $App.configPaths = @($existing + @($ConfigPath))
+    }
+}
+
+function Merge-ConfigBackupIntoManifest {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Manifest,
+
+        [Parameter(Mandatory = $true)]
+        $BackupMetadata
+    )
+
+    Add-PropertyIfMissing -Object $Manifest -Name "configBackups" -Value @()
+    Add-PropertyIfMissing -Object $Manifest -Name "unmatchedConfigPaths" -Value @()
+
+    $backupSummary = [ordered]@{
+        createdAt = [string](Get-MapValue -Map $BackupMetadata -Key "createdAt")
+        backupRoot = [string](Get-MapValue -Map $BackupMetadata -Key "backupRoot")
+        includeSensitive = [bool](Get-MapValue -Map $BackupMetadata -Key "includeSensitive")
+        summary = (Get-MapValue -Map $BackupMetadata -Key "summary")
+    }
+    $existingBackups = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "configBackups"))
+    $Manifest.configBackups = @($existingBackups + @($backupSummary))
+
+    foreach ($record in @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $BackupMetadata -Key "configs"))) {
+        $status = [string](Get-MapValue -Map $record -Key "backupStatus")
+        if ($status -ne "backed_up") {
+            continue
+        }
+
+        $configPath = New-ManifestConfigPathRecord -Record $record
+        $app = Find-ManifestAppForConfigRecord -Manifest $Manifest -Record $record
+        if ($null -eq $app) {
+            $existingUnmatched = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "unmatchedConfigPaths"))
+            $Manifest.unmatchedConfigPaths = @($existingUnmatched + @($configPath))
+        } else {
+            Add-ConfigPathToApp -App $app -ConfigPath $configPath
+        }
+    }
+}
+
+function Merge-LatestConfigBackupIntoManifest {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Manifest,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath
+    )
+
+    $latestConfigBackupPath = Get-LatestConfigBackupMetadataPath -RootPath $RootPath
+    if (-not (Test-Path -LiteralPath $latestConfigBackupPath)) {
+        return $false
+    }
+
+    try {
+        $metadata = Get-Content -Raw -LiteralPath $latestConfigBackupPath | ConvertFrom-Json
+        Merge-ConfigBackupIntoManifest -Manifest $Manifest -BackupMetadata $metadata
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 function Get-RegistryUninstallEvidence {
@@ -3118,6 +3809,156 @@ function Invoke-Report {
     Write-Info ("Log updated: {0}" -f (Get-LogPath -RootPath $resolvedRoot))
 }
 
+function Show-ConfigBackupPlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Candidates,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BackupRootPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ReportPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$MetadataPath
+    )
+
+    $safe = @($Candidates | Where-Object { [string](Get-MapValue -Map $_ -Key "type") -eq "safe" })
+    $sensitive = @($Candidates | Where-Object { [string](Get-MapValue -Map $_ -Key "type") -eq "sensitive" })
+    $detectOnly = @($Candidates | Where-Object { [string](Get-MapValue -Map $_ -Key "type") -eq "detect-only" })
+
+    Write-Host ""
+    Write-Host "Config Backup Plan"
+    Write-Host ""
+    Write-Host ("Backup root: {0}" -f $BackupRootPath)
+    Write-Host ("Metadata: {0}" -f $MetadataPath)
+    Write-Host ("Report: {0}" -f $ReportPath)
+    Write-Host ""
+    Write-Host ("Safe configs to back up: {0}" -f $safe.Count)
+    foreach ($item in $safe) {
+        Write-Host ("- {0}: {1}" -f (Get-MapValue -Map $item -Key "name"), (Get-MapValue -Map $item -Key "originalPath"))
+    }
+    Write-Host ""
+    Write-Host ("Sensitive configs skipped by default: {0}" -f $sensitive.Count)
+    foreach ($item in $sensitive) {
+        Write-Host ("- {0}: {1}" -f (Get-MapValue -Map $item -Key "name"), (Get-MapValue -Map $item -Key "originalPath"))
+        foreach ($warning in (ConvertTo-ArrayValue -Value (Get-MapValue -Map $item -Key "warnings"))) {
+            Write-WarningText $warning
+        }
+    }
+    Write-Host ""
+    Write-Host ("Detect-only profiles: {0}" -f $detectOnly.Count)
+    foreach ($item in $detectOnly) {
+        Write-Host ("- {0}: {1}" -f (Get-MapValue -Map $item -Key "name"), (Get-MapValue -Map $item -Key "originalPath"))
+    }
+    Write-Host ""
+    Write-Host "Folder copy exclusions: cache, logs, temp, tmp, crash, node_modules, *.log, *.tmp, *.cache"
+}
+
+function Invoke-Backup {
+    param(
+        [string]$RootPath,
+        [switch]$DryRunOnly
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RootPath)) {
+        $RootPath = $script:DefaultRoot
+    }
+
+    $resolvedRoot = Resolve-DisplayPath -Path $RootPath
+    $timestamp = Get-FileTimestamp
+    $backupRoot = Get-ConfigBackupRootPath -RootPath $resolvedRoot -Timestamp $timestamp
+    $configsRoot = Join-Path $backupRoot "configs"
+    $metadataPath = Get-ConfigBackupMetadataPath -BackupRootPath $backupRoot
+    $latestMetadataPath = Get-LatestConfigBackupMetadataPath -RootPath $resolvedRoot
+    $reportPath = Get-ConfigBackupReportPath -RootPath $resolvedRoot -Timestamp $timestamp
+    $logPath = Get-LogPath -RootPath $resolvedRoot
+    $candidates = @(Get-DiscoveredConfigCandidates)
+
+    Show-ConfigBackupPlan -Candidates $candidates -BackupRootPath $backupRoot -ReportPath $reportPath -MetadataPath $metadataPath
+
+    if ($DryRunOnly) {
+        Write-Host ""
+        Write-Info "Dry-run only. No config backup, metadata, report, manifest, or log files were written."
+        return
+    }
+
+    $sensitiveCandidates = @($candidates | Where-Object { [string](Get-MapValue -Map $_ -Key "type") -eq "sensitive" })
+    $includeSensitive = $false
+    if ($sensitiveCandidates.Count -gt 0) {
+        Write-Host ""
+        Write-WarningText "Sensitive configs were detected and will be skipped by default."
+        Write-WarningText "They may contain private keys, access tokens, registry credentials, or environment secrets."
+        $sensitiveAnswer = Read-Host "Type INCLUDE to back up sensitive configs, or press Enter to skip"
+        $includeSensitive = ($sensitiveAnswer -eq "INCLUDE")
+    }
+
+    if (-not (Read-RequiredConfirmation -Prompt "Back up detected WinCarry config files?")) {
+        Write-Host ""
+        Write-Info "Config backup cancelled. No files were changed."
+        return
+    }
+
+    foreach ($folder in @($backupRoot, $configsRoot, (Join-Path $resolvedRoot "reports"), (Join-Path $resolvedRoot "logs"), (Join-Path $resolvedRoot "backups"))) {
+        if (-not (Test-Path -LiteralPath $folder)) {
+            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        }
+    }
+
+    $configRecords = @()
+    $detectOnlyRecords = @()
+    foreach ($candidate in $candidates) {
+        $type = [string](Get-MapValue -Map $candidate -Key "type")
+        if ($type -eq "detect-only") {
+            $detectOnlyRecords += New-ConfigBackupRecord -Candidate $candidate -Status "detected_only"
+            continue
+        }
+
+        if ($type -eq "sensitive" -and -not $includeSensitive) {
+            $configRecords += New-ConfigBackupRecord -Candidate $candidate -Status "skipped_sensitive"
+            continue
+        }
+
+        $copyResult = Copy-ConfigCandidate -Candidate $candidate -ConfigsRootPath $configsRoot -IncludeSensitive:$includeSensitive
+        $configRecords += New-ConfigBackupRecord -Candidate $candidate -Status ([string]$copyResult.backupStatus) -BackupPath ([string]$copyResult.backupPath) -CopiedFiles ([int]$copyResult.copiedFiles) -SkippedFiles ([int]$copyResult.skippedFiles) -SkippedSensitiveFiles ([int]$copyResult.skippedSensitiveFiles) -ErrorMessage ([string]$copyResult.error)
+    }
+
+    $metadata = New-ConfigBackupMetadata -RootPath $resolvedRoot -BackupRootPath $backupRoot -ConfigRecords $configRecords -DetectOnlyRecords $detectOnlyRecords -IncludeSensitive $includeSensitive
+    $metadataJson = $metadata | ConvertTo-Json -Depth 16
+    Set-Content -LiteralPath $metadataPath -Value $metadataJson -Encoding UTF8
+    Set-Content -LiteralPath $latestMetadataPath -Value $metadataJson -Encoding UTF8
+    Set-Content -LiteralPath $reportPath -Value (Convert-ConfigBackupReportToMarkdown -Metadata $metadata) -Encoding UTF8
+
+    $latestManifestPath = Get-LatestManifestPath -RootPath $resolvedRoot
+    $manifestUpdated = $false
+    if (Test-Path -LiteralPath $latestManifestPath) {
+        try {
+            $manifest = Get-Content -Raw -LiteralPath $latestManifestPath | ConvertFrom-Json
+            Merge-ConfigBackupIntoManifest -Manifest $manifest -BackupMetadata $metadata
+            Set-Content -LiteralPath $latestManifestPath -Value ($manifest | ConvertTo-Json -Depth 20) -Encoding UTF8
+            $manifestUpdated = $true
+        } catch {
+            Write-WarningText ("Latest manifest was not updated: {0}" -f $_.Exception.Message)
+        }
+    } else {
+        Write-WarningText ("Latest manifest not found, so config mappings were not added to a manifest yet: {0}" -f $latestManifestPath)
+        Write-Info "Run manifest after backup to include the latest config backup metadata."
+    }
+
+    $message = "Config backup completed for root {0}; backedUp={1}; skippedSensitive={2}; failed={3}; detectOnly={4}; manifestUpdated={5}" -f $resolvedRoot, $metadata.summary.backedUp, $metadata.summary.skippedSensitive, $metadata.summary.failed, $metadata.summary.detectOnly, $manifestUpdated
+    Write-WinCarryLog -RootPath $resolvedRoot -Operation "backup" -Result "success" -Message $message
+
+    Write-Host ""
+    Write-Info ("Config backup metadata written: {0}" -f $metadataPath)
+    Write-Info ("Latest config backup metadata updated: {0}" -f $latestMetadataPath)
+    Write-Info ("Backup report written: {0}" -f $reportPath)
+    if ($manifestUpdated) {
+        Write-Info ("Latest manifest updated with config paths: {0}" -f $latestManifestPath)
+    }
+    Write-Info ("Log updated: {0}" -f $logPath)
+}
+
 function Show-SetupPlan {
     param(
         [Parameter(Mandatory = $true)]
@@ -3231,12 +4072,12 @@ function Show-Help {
     Write-Host "  .\wincarry.ps1 scan [-Root D:\WinCarry] [-DryRun]"
     Write-Host "  .\wincarry.ps1 manifest [-Root D:\WinCarry] [-DryRun]"
     Write-Host "  .\wincarry.ps1 report [-Root D:\WinCarry] [-DryRun]"
-    Write-Host "  .\wincarry.ps1 backup"
+    Write-Host "  .\wincarry.ps1 backup [-Root D:\WinCarry] [-DryRun]"
     Write-Host "  .\wincarry.ps1 restore"
     Write-Host "  .\wincarry.ps1 offline"
     Write-Host "  .\wincarry.ps1 junction"
     Write-Host ""
-    Write-Host "Implemented: CLI shell, setup, preflight, app detection/classification, manifests, and reports."
+    Write-Host "Implemented: CLI shell, setup, preflight, app detection/classification, manifests, reports, and config backup."
     Write-Host "Later-phase commands currently show placeholders and make no changes."
 }
 
@@ -3283,7 +4124,13 @@ function Show-MainMenu {
                 }
                 Invoke-Scan -RootPath $rootInput
             }
-            "4" { Show-CommandPlaceholder -CommandName "backup" -Phase "Phase 6" }
+            "4" {
+                $rootInput = Read-Host ("WinCarry root [{0}]" -f $script:DefaultRoot)
+                if ([string]::IsNullOrWhiteSpace($rootInput)) {
+                    $rootInput = $script:DefaultRoot
+                }
+                Invoke-Backup -RootPath $rootInput
+            }
             "5" {
                 $rootInput = Read-Host ("WinCarry root [{0}]" -f $script:DefaultRoot)
                 if ([string]::IsNullOrWhiteSpace($rootInput)) {
@@ -3333,7 +4180,7 @@ function Invoke-CommandRouter {
         "setup" { Invoke-Setup -RootPath $Root -DryRunOnly:$DryRun }
         "preflight" { Invoke-Preflight -RootPath $Root -DryRunOnly:$DryRun }
         "scan" { Invoke-Scan -RootPath $Root -DryRunOnly:$DryRun }
-        "backup" { Show-CommandPlaceholder -CommandName "backup" -Phase "Phase 6" }
+        "backup" { Invoke-Backup -RootPath $Root -DryRunOnly:$DryRun }
         "manifest" { Invoke-Manifest -RootPath $Root -DryRunOnly:$DryRun }
         "restore" { Show-CommandPlaceholder -CommandName "restore" -Phase "Phase 7" }
         "report" { Invoke-Report -RootPath $Root -DryRunOnly:$DryRun }
