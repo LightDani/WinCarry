@@ -31,6 +31,26 @@ function Resolve-RestoreRootPath {
     return (Resolve-DisplayPath -Path $script:DefaultRoot)
 }
 
+function Resolve-RestoreManifestPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [string]$ManifestPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
+        return (Get-LatestManifestPath -RootPath $RootPath)
+    }
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($ManifestPath)
+    if ([System.IO.Path]::IsPathRooted($expanded)) {
+        return (Resolve-DisplayPath -Path $expanded)
+    }
+
+    return (Resolve-DisplayPath -Path (Join-Path $RootPath $expanded))
+}
+
 function Test-SameDisplayPath {
     param(
         [string]$Left,
@@ -66,7 +86,7 @@ function Read-WinCarryManifest {
 
     if (-not (Test-Path -LiteralPath $ManifestPath)) {
         Write-Host ""
-        Write-WarningText ("Latest manifest not found: {0}" -f $ManifestPath)
+        Write-WarningText ("Manifest not found: {0}" -f $ManifestPath)
         Write-Info "Run manifest before restore, or copy the preserved WinCarry root that contains manifests\latest.json."
         return $null
     }
@@ -75,7 +95,7 @@ function Read-WinCarryManifest {
         return (Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json)
     } catch {
         Write-Host ""
-        Write-ErrorText ("Could not read latest manifest: {0}" -f $_.Exception.Message)
+        Write-ErrorText ("Could not read manifest: {0}" -f $_.Exception.Message)
         return $null
     }
 }
@@ -1556,12 +1576,13 @@ function Ensure-RestoreArtifactDirectories {
 function Invoke-Restore {
     param(
         [string]$RootPath,
+        [string]$ManifestPath,
         [switch]$DryRunOnly
     )
 
     $resolvedRoot = Resolve-RestoreRootPath -RootPath $RootPath
-    $latestManifestPath = Get-LatestManifestPath -RootPath $resolvedRoot
-    $manifest = Read-WinCarryManifest -ManifestPath $latestManifestPath
+    $restoreManifestPath = Resolve-RestoreManifestPath -RootPath $resolvedRoot -ManifestPath $ManifestPath
+    $manifest = Read-WinCarryManifest -ManifestPath $restoreManifestPath
     if ($null -eq $manifest) {
         return
     }
@@ -1612,7 +1633,7 @@ function Invoke-Restore {
     $currentScan = New-AppScanSnapshot -RootPath $resolvedRoot
     $currentApps = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $currentScan -Key "apps"))
 
-    $plan = New-RestorePlan -Manifest $manifest -Preflight $preflight -ManifestPath $latestManifestPath -RootPath $resolvedRoot -SelectionMode $selectionMode -VersionPolicy $versionPolicy -SelectedApps $selectedApps -Warnings $warnings
+    $plan = New-RestorePlan -Manifest $manifest -Preflight $preflight -ManifestPath $restoreManifestPath -RootPath $resolvedRoot -SelectionMode $selectionMode -VersionPolicy $versionPolicy -SelectedApps $selectedApps -Warnings $warnings
     $configPreview = New-ConfigRestorePlan -Manifest $manifest -ConflictPolicy "missing-only" -ExistingBackupRootPath $existingConfigBackupRoot -CurrentApps $currentApps
     Set-MapValue -Map $plan -Key "configRestore" -Value $configPreview
     Show-RestorePlan -Plan $plan

@@ -141,6 +141,28 @@ function Get-ManifestPath {
     return (Join-Path (Join-Path $RootPath "manifests") $manifestFileName)
 }
 
+function Get-RestoreScriptPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Timestamp
+    )
+
+    $scriptFileName = "{0}_restore.ps1" -f $Timestamp
+    return (Join-Path (Join-Path $RootPath "restore-scripts") $scriptFileName)
+}
+
+function Get-LatestRestoreScriptPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath
+    )
+
+    return (Join-Path (Join-Path $RootPath "restore-scripts") "restore-latest.ps1")
+}
+
 function Get-LatestManifestPath {
     param(
         [Parameter(Mandatory = $true)]
@@ -205,6 +227,8 @@ function Get-ManifestArtifactPaths {
     return [ordered]@{
         manifest = (Get-ManifestPath -RootPath $RootPath -Timestamp $Timestamp)
         latestManifest = (Get-LatestManifestPath -RootPath $RootPath)
+        restoreScript = (Get-RestoreScriptPath -RootPath $RootPath -Timestamp $Timestamp)
+        latestRestoreScript = (Get-LatestRestoreScriptPath -RootPath $RootPath)
         reportMarkdown = (Get-ScanReportPath -RootPath $RootPath -Timestamp $Timestamp -Extension "md")
         reportText = (Get-ScanReportPath -RootPath $RootPath -Timestamp $Timestamp -Extension "txt")
         manualReinstallList = (Get-ManualReinstallListPath -RootPath $RootPath -Timestamp $Timestamp)

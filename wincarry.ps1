@@ -10,7 +10,7 @@ Current implemented scope:
 - Dry-run and confirmation helpers
 - Preflight system snapshot
 - App detection scan with raw evidence, deduplication, and classification
-- Manifest and report generation
+- Manifest, restore script, and report generation
 - Config detection and safe backup
 - Restore dry-run, package-manager reinstall flow, and guarded config restore
 #>
@@ -21,6 +21,7 @@ param(
     [string]$Command = "menu",
 
     [string]$Root,
+    [string]$Manifest,
 
     [switch]$DryRun
 )

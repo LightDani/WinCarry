@@ -133,11 +133,11 @@ function Show-Help {
     Write-Host "  .\wincarry.ps1 manifest [-Root D:\WinCarry] [-DryRun]"
     Write-Host "  .\wincarry.ps1 report [-Root D:\WinCarry] [-DryRun]"
     Write-Host "  .\wincarry.ps1 backup [-Root D:\WinCarry] [-DryRun]"
-    Write-Host "  .\wincarry.ps1 restore [-Root D:\WinCarry] [-DryRun]"
+    Write-Host "  .\wincarry.ps1 restore [-Root D:\WinCarry] [-Manifest path] [-DryRun]"
     Write-Host "  .\wincarry.ps1 offline"
     Write-Host "  .\wincarry.ps1 junction"
     Write-Host ""
-    Write-Host "Implemented: CLI shell, setup, preflight, app detection/classification, manifests, reports, config backup, package-manager restore, and guarded config restore."
+    Write-Host "Implemented: CLI shell, setup, preflight, app detection/classification, manifests, reports, restore scripts, config backup, package-manager restore, and guarded config restore."
     Write-Host "Offline and junction currently show placeholders and make no changes."
 }
 
@@ -248,7 +248,7 @@ function Invoke-CommandRouter {
         "scan" { Invoke-Scan -RootPath $Root -DryRunOnly:$DryRun }
         "backup" { Invoke-Backup -RootPath $Root -DryRunOnly:$DryRun }
         "manifest" { Invoke-Manifest -RootPath $Root -DryRunOnly:$DryRun }
-        "restore" { Invoke-Restore -RootPath $Root -DryRunOnly:$DryRun }
+        "restore" { Invoke-Restore -RootPath $Root -ManifestPath $Manifest -DryRunOnly:$DryRun }
         "report" { Invoke-Report -RootPath $Root -DryRunOnly:$DryRun }
         "offline" { Show-CommandPlaceholder -CommandName "offline" -Phase "Phase 11" }
         "junction" { Show-CommandPlaceholder -CommandName "junction" -Phase "Phase 10" }

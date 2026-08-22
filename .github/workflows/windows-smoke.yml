@@ -47,6 +47,12 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 scan -Root $root -DryRun
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 manifest -Root $root -DryRun
           "YES" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 manifest -Root $root
+          $latestRestoreScript = Join-Path $root "restore-scripts\restore-latest.ps1"
+          if (-not (Test-Path -LiteralPath $latestRestoreScript)) { throw "Expected restore-latest.ps1 to be generated." }
+          $timestampedRestoreScript = Get-ChildItem -LiteralPath (Join-Path $root "restore-scripts") -Filter "*_restore.ps1" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($null -eq $timestampedRestoreScript) { throw "Expected timestamped restore script to be generated." }
+          $generatedRestoreOutput = @(powershell -NoProfile -ExecutionPolicy Bypass -File $timestampedRestoreScript.FullName -DryRun 2>&1 | ForEach-Object { [string]$_ })
+          if (-not (($generatedRestoreOutput -join "`n") -match "Manifest: .*_manifest\.json")) { throw "Generated restore script did not load its timestamped manifest." }
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 report -Root $root -DryRun
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root $root -DryRun
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 backup -Root $root -DryRun

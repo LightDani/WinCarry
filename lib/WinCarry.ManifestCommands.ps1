@@ -28,15 +28,83 @@ function Show-ManifestPlan {
 function Ensure-ManifestArtifactDirectories {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$RootPath
+        [string]$RootPath,
+
+        [switch]$IncludeRestoreScripts
     )
 
-    foreach ($folder in @("manifests", "reports", "logs")) {
+    $folders = @("manifests", "reports", "logs")
+    if ($IncludeRestoreScripts) {
+        $folders += "restore-scripts"
+    }
+
+    foreach ($folder in $folders) {
         $path = Join-Path $RootPath $folder
         if (-not (Test-Path -LiteralPath $path)) {
             New-Item -ItemType Directory -Path $path -Force | Out-Null
         }
     }
+}
+
+function New-RestoreScriptContent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestFileName
+    )
+
+    $template = @'
+<#
+WinCarry generated restore launcher.
+Run from the preserved WinCarry root after Windows reinstall.
+#>
+
+[CmdletBinding()]
+param(
+    [switch]$DryRun
+)
+
+$ErrorActionPreference = "Stop"
+$scriptPath = $PSCommandPath
+if ([string]::IsNullOrWhiteSpace($scriptPath) -and $MyInvocation.MyCommand.Path) {
+    $scriptPath = $MyInvocation.MyCommand.Path
+}
+
+if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+    throw "Cannot determine restore script path."
+}
+
+$restoreScriptDirectory = Split-Path -Parent $scriptPath
+$winCarryRoot = Split-Path -Parent $restoreScriptDirectory
+$winCarryScript = Join-Path $winCarryRoot "wincarry.ps1"
+$manifestPath = Join-Path (Join-Path $winCarryRoot "manifests") "__MANIFEST_FILE_NAME__"
+
+if (-not (Test-Path -LiteralPath $winCarryScript)) {
+    throw ("WinCarry entrypoint not found: {0}" -f $winCarryScript)
+}
+
+if (-not (Test-Path -LiteralPath $manifestPath)) {
+    throw ("Intended manifest not found: {0}" -f $manifestPath)
+}
+
+if ($DryRun) {
+    & $winCarryScript restore -Root $winCarryRoot -Manifest $manifestPath -DryRun
+} else {
+    & $winCarryScript restore -Root $winCarryRoot -Manifest $manifestPath
+}
+'@
+
+    return $template.Replace("__MANIFEST_FILE_NAME__", $ManifestFileName)
+}
+
+function Write-RestoreScripts {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Paths
+    )
+
+    $manifestFileName = Split-Path -Leaf ([string](Get-MapValue -Map $Paths -Key "manifest"))
+    Set-Content -LiteralPath $Paths.restoreScript -Value (New-RestoreScriptContent -ManifestFileName $manifestFileName) -Encoding UTF8
+    Set-Content -LiteralPath $Paths.latestRestoreScript -Value (New-RestoreScriptContent -ManifestFileName "latest.json") -Encoding UTF8
 }
 
 function Write-ManifestArtifacts {
@@ -54,6 +122,7 @@ function Write-ManifestArtifacts {
         $manifestJson = $Manifest | ConvertTo-Json -Depth 20
         Set-Content -LiteralPath $Paths.manifest -Value $manifestJson -Encoding UTF8
         Set-Content -LiteralPath $Paths.latestManifest -Value $manifestJson -Encoding UTF8
+        Write-RestoreScripts -Paths $Paths
     }
 
     $markdown = Convert-ManifestReportToMarkdown -Manifest $Manifest
@@ -87,7 +156,7 @@ function Invoke-Manifest {
 
     if ($DryRunOnly) {
         Write-Host ""
-        Write-Info "Dry-run only. No manifest, report, list, or log files were written."
+        Write-Info "Dry-run only. No manifest, restore script, report, list, or log files were written."
         return
     }
 
@@ -97,7 +166,7 @@ function Invoke-Manifest {
         return
     }
 
-    Ensure-ManifestArtifactDirectories -RootPath $scan.root.resolvedRoot
+    Ensure-ManifestArtifactDirectories -RootPath $scan.root.resolvedRoot -IncludeRestoreScripts
     Write-ManifestArtifacts -Manifest $manifest -Paths $paths -IncludeManifestFiles
 
     $message = "Manifest generated for root {0}; apps={1}; manual={2}; unsupported={3}; manifest={4}" -f $scan.root.resolvedRoot, $manifest.summary.appCount, $manifest.summary.manualReinstallCount, $manifest.summary.unsupportedCount, $paths.manifest
@@ -106,6 +175,8 @@ function Invoke-Manifest {
     Write-Host ""
     Write-Info ("Manifest written: {0}" -f $paths.manifest)
     Write-Info ("Latest manifest updated: {0}" -f $paths.latestManifest)
+    Write-Info ("Restore script written: {0}" -f $paths.restoreScript)
+    Write-Info ("Latest restore script updated: {0}" -f $paths.latestRestoreScript)
     Write-Info ("Markdown report written: {0}" -f $paths.reportMarkdown)
     Write-Info ("Text report written: {0}" -f $paths.reportText)
     Write-Info ("Manual reinstall list written: {0}" -f $paths.manualReinstallList)
