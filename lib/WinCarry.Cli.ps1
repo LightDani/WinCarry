@@ -120,10 +120,10 @@ function Show-Help {
     Write-Host "  .\wincarry.ps1 backup [-Root D:\WinCarry] [-DryRun]"
     Write-Host "  .\wincarry.ps1 restore [-Root D:\WinCarry] [-Manifest path] [-DryRun]"
     Write-Host "  .\wincarry.ps1 offline"
-    Write-Host "  .\wincarry.ps1 junction"
+    Write-Host "  .\wincarry.ps1 junction [-Root D:\WinCarry] [-DryRun]"
     Write-Host ""
-    Write-Host "Implemented: CLI shell, setup, preflight, app detection/classification, manifests, reports, restore scripts, config backup, package-manager restore, and guarded config restore."
-    Write-Host "Offline and junction currently show placeholders and make no changes."
+    Write-Host "Implemented: CLI shell, setup, preflight, app detection/classification, manifests, reports, restore scripts, config backup, package-manager restore, guarded config restore, and advanced junction mode."
+    Write-Host "Offline currently shows a placeholder and makes no changes."
 }
 
 function Show-MainMenu {
@@ -197,7 +197,13 @@ function Show-MainMenu {
                 }
                 Invoke-Report -RootPath $rootInput
             }
-            "8" { Show-CommandPlaceholder -CommandName "junction" -Phase "Phase 10" }
+            "8" {
+                $rootInput = Read-Host ("WinCarry root [{0}]" -f $script:DefaultRoot)
+                if ([string]::IsNullOrWhiteSpace($rootInput)) {
+                    $rootInput = $script:DefaultRoot
+                }
+                Invoke-Junction -RootPath $rootInput
+            }
             "9" { Show-CommandPlaceholder -CommandName "offline" -Phase "Phase 11" }
             "0" {
                 Write-Host ""
@@ -236,7 +242,7 @@ function Invoke-CommandRouter {
         "restore" { Invoke-Restore -RootPath $Root -ManifestPath $Manifest -DryRunOnly:$DryRun }
         "report" { Invoke-Report -RootPath $Root -DryRunOnly:$DryRun }
         "offline" { Show-CommandPlaceholder -CommandName "offline" -Phase "Phase 11" }
-        "junction" { Show-CommandPlaceholder -CommandName "junction" -Phase "Phase 10" }
+        "junction" { Invoke-Junction -RootPath $Root -DryRunOnly:$DryRun }
         "help" { Show-Help }
     }
 }
