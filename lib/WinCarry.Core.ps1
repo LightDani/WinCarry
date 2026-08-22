@@ -89,6 +89,133 @@ function Get-WinCarryFolders {
     )
 }
 
+
+function ConvertTo-WinCarryComparablePath {
+    param(
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+
+    $expandedPath = [Environment]::ExpandEnvironmentVariables($Path)
+
+    try {
+        if (Test-Path -LiteralPath $expandedPath) {
+            $resolvedPath = Resolve-Path -LiteralPath $expandedPath -ErrorAction Stop
+            if ($resolvedPath -and $resolvedPath.Path) {
+                $fullPath = $resolvedPath.Path
+            } else {
+                $fullPath = [System.IO.Path]::GetFullPath($expandedPath)
+            }
+        } else {
+            $fullPath = [System.IO.Path]::GetFullPath($expandedPath)
+        }
+    } catch {
+        $fullPath = $expandedPath
+    }
+
+    return ([string]$fullPath).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar).ToLowerInvariant()
+}
+
+function Test-WinCarrySamePath {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    $leftPath = ConvertTo-WinCarryComparablePath -Path $Left
+    $rightPath = ConvertTo-WinCarryComparablePath -Path $Right
+
+    if ([string]::IsNullOrWhiteSpace($leftPath) -or [string]::IsNullOrWhiteSpace($rightPath)) {
+        return $false
+    }
+
+    return ($leftPath -eq $rightPath)
+}
+
+function Get-WinCarryLauncherDependencyPaths {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath
+    )
+
+    $helperRoot = Join-Path $RootPath $script:HelperFolderName
+    $helpers = @()
+
+    foreach ($helperScriptFileName in $script:HelperScriptFileNames) {
+        $helpers += (Join-Path $helperRoot $helperScriptFileName)
+    }
+
+    return [ordered]@{
+        entrypoint = (Join-Path $RootPath $script:ScriptFileName)
+        helperRoot = $helperRoot
+        helpers = $helpers
+    }
+}
+
+function Sync-WinCarryLauncherDependencies {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [switch]$Overwrite
+    )
+
+    if (-not (Test-Path -LiteralPath $RootPath)) {
+        New-Item -ItemType Directory -Path $RootPath -Force -ErrorAction Stop | Out-Null
+    }
+
+    $sourceScript = Get-CurrentScriptPath
+    $sourceHelperRoot = Join-Path (Get-ScriptDirectory) $script:HelperFolderName
+    $destinationPaths = Get-WinCarryLauncherDependencyPaths -RootPath $RootPath
+    $copied = @()
+    $skipped = @()
+
+    if (-not (Test-Path -LiteralPath $sourceScript)) {
+        throw ("WinCarry source entrypoint was not found: {0}" -f $sourceScript)
+    }
+
+    if (-not (Test-WinCarrySamePath -Left $sourceScript -Right $destinationPaths.entrypoint)) {
+        if ($Overwrite -or -not (Test-Path -LiteralPath $destinationPaths.entrypoint)) {
+            Copy-Item -LiteralPath $sourceScript -Destination $destinationPaths.entrypoint -Force -ErrorAction Stop
+            $copied += $destinationPaths.entrypoint
+        } else {
+            $skipped += $destinationPaths.entrypoint
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $destinationPaths.helperRoot)) {
+        New-Item -ItemType Directory -Path $destinationPaths.helperRoot -Force -ErrorAction Stop | Out-Null
+    }
+
+    foreach ($helperScriptFileName in $script:HelperScriptFileNames) {
+        $sourceHelperScript = Join-Path $sourceHelperRoot $helperScriptFileName
+        $destinationHelperScript = Join-Path $destinationPaths.helperRoot $helperScriptFileName
+
+        if (-not (Test-Path -LiteralPath $sourceHelperScript)) {
+            throw ("WinCarry source helper script was not found: {0}" -f $sourceHelperScript)
+        }
+
+        if (Test-WinCarrySamePath -Left $sourceHelperScript -Right $destinationHelperScript) {
+            continue
+        }
+
+        if ($Overwrite -or -not (Test-Path -LiteralPath $destinationHelperScript)) {
+            Copy-Item -LiteralPath $sourceHelperScript -Destination $destinationHelperScript -Force -ErrorAction Stop
+            $copied += $destinationHelperScript
+        } else {
+            $skipped += $destinationHelperScript
+        }
+    }
+
+    return [ordered]@{
+        copied = $copied
+        skipped = $skipped
+    }
+}
+
 function Get-SettingsPath {
     param(
         [Parameter(Mandatory = $true)]

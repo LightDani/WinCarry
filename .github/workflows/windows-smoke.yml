@@ -53,6 +53,15 @@ jobs:
           if ($null -eq $timestampedRestoreScript) { throw "Expected timestamped restore script to be generated." }
           $generatedRestoreOutput = @(powershell -NoProfile -ExecutionPolicy Bypass -File $timestampedRestoreScript.FullName -DryRun 2>&1 | ForEach-Object { [string]$_ })
           if (-not (($generatedRestoreOutput -join "`n") -match "Manifest: .*_manifest\.json")) { throw "Generated restore script did not load its timestamped manifest." }
+          $manifestOnlyRoot = Join-Path $env:RUNNER_TEMP "WinCarry-Manifest-Only"
+          Remove-Item -LiteralPath $manifestOnlyRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $manifestOnlyRoot | Out-Null
+          "YES" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 manifest -Root $manifestOnlyRoot
+          $manifestOnlyEntrypoint = Join-Path $manifestOnlyRoot "wincarry.ps1"
+          if (-not (Test-Path -LiteralPath $manifestOnlyEntrypoint)) { throw "Expected manifest to sync wincarry.ps1 into manifest-only root." }
+          if (@(Get-ChildItem -LiteralPath (Join-Path $manifestOnlyRoot "lib") -Filter "WinCarry.*.ps1").Count -ne 9) { throw "Expected manifest to sync 9 helper scripts into manifest-only root." }
+          $manifestOnlyRestoreOutput = @(powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $manifestOnlyRoot "restore-scripts\restore-latest.ps1") -DryRun 2>&1 | ForEach-Object { [string]$_ })
+          if (-not (($manifestOnlyRestoreOutput -join "`n") -match "Manifest: .*latest\.json")) { throw "Manifest-only restore launcher did not load latest manifest." }
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 report -Root $root -DryRun
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root $root -DryRun
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 backup -Root $root -DryRun

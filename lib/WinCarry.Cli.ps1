@@ -81,22 +81,7 @@ function Invoke-Setup {
         Set-Content -LiteralPath $settingsPath -Value $settingsJson -Encoding UTF8
     }
 
-    $sourceScript = Get-CurrentScriptPath
-    $sourceHelperRoot = Join-Path (Get-ScriptDirectory) $script:HelperFolderName
-    $destinationHelperRoot = Join-Path $RootPath $script:HelperFolderName
-    $destinationScript = Join-Path $RootPath $script:ScriptFileName
-
-    if (($sourceScript -ne $destinationScript) -and (Test-Path -LiteralPath $sourceScript) -and (-not (Test-Path -LiteralPath $destinationScript))) {
-        Copy-Item -LiteralPath $sourceScript -Destination $destinationScript
-    }
-
-    foreach ($helperScriptFileName in $script:HelperScriptFileNames) {
-        $sourceHelperScript = Join-Path $sourceHelperRoot $helperScriptFileName
-        $destinationHelperScript = Join-Path $destinationHelperRoot $helperScriptFileName
-        if (($sourceHelperScript -ne $destinationHelperScript) -and (Test-Path -LiteralPath $sourceHelperScript) -and (-not (Test-Path -LiteralPath $destinationHelperScript))) {
-            Copy-Item -LiteralPath $sourceHelperScript -Destination $destinationHelperScript
-        }
-    }
+    $null = Sync-WinCarryLauncherDependencies -RootPath $RootPath
 
     Write-WinCarryLog -RootPath $RootPath -Operation "setup" -Result "success" -Message ("Root initialized at {0}" -f $RootPath)
 

@@ -25,6 +25,21 @@ function Show-ManifestPlan {
     }
 }
 
+
+function Show-ManifestLauncherDependencyPlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath
+    )
+
+    $launcherPaths = Get-WinCarryLauncherDependencyPaths -RootPath $RootPath
+    Write-Host ""
+    Write-Host "Will sync restore launcher dependencies:"
+    Write-Host ("- {0}" -f $launcherPaths.entrypoint)
+    Write-Host ("- {0} (helper scripts)" -f $launcherPaths.helperRoot)
+    Write-Host "Existing WinCarry launcher files in the target root may be overwritten."
+}
+
 function Ensure-ManifestArtifactDirectories {
     param(
         [Parameter(Mandatory = $true)]
@@ -153,20 +168,22 @@ function Invoke-Manifest {
     $timestamp = Get-FileTimestamp
     $paths = Get-ManifestArtifactPaths -RootPath $scan.root.resolvedRoot -Timestamp $timestamp
     Show-ManifestPlan -Manifest $manifest -Paths $paths -ActionLabel "Prepare Reinstall Manifest"
+    Show-ManifestLauncherDependencyPlan -RootPath $scan.root.resolvedRoot
 
     if ($DryRunOnly) {
         Write-Host ""
-        Write-Info "Dry-run only. No manifest, restore script, report, list, or log files were written."
+        Write-Info "Dry-run only. No manifest, restore script, launcher files, report, list, or log files were written."
         return
     }
 
-    if (-not (Read-RequiredConfirmation -Prompt "Generate WinCarry manifest and report files?")) {
+    if (-not (Read-RequiredConfirmation -Prompt "Generate WinCarry manifest, restore scripts, and launcher files?")) {
         Write-Host ""
         Write-Info "Manifest generation cancelled. No files were changed."
         return
     }
 
     Ensure-ManifestArtifactDirectories -RootPath $scan.root.resolvedRoot -IncludeRestoreScripts
+    $launcherSync = Sync-WinCarryLauncherDependencies -RootPath $scan.root.resolvedRoot -Overwrite
     Write-ManifestArtifacts -Manifest $manifest -Paths $paths -IncludeManifestFiles
 
     $message = "Manifest generated for root {0}; apps={1}; manual={2}; unsupported={3}; manifest={4}" -f $scan.root.resolvedRoot, $manifest.summary.appCount, $manifest.summary.manualReinstallCount, $manifest.summary.unsupportedCount, $paths.manifest
@@ -177,6 +194,11 @@ function Invoke-Manifest {
     Write-Info ("Latest manifest updated: {0}" -f $paths.latestManifest)
     Write-Info ("Restore script written: {0}" -f $paths.restoreScript)
     Write-Info ("Latest restore script updated: {0}" -f $paths.latestRestoreScript)
+    if ($launcherSync.copied.Count -gt 0) {
+        Write-Info ("Restore launcher dependencies synced: {0} file(s)" -f $launcherSync.copied.Count)
+    } else {
+        Write-Info "Restore launcher dependencies already current."
+    }
     Write-Info ("Markdown report written: {0}" -f $paths.reportMarkdown)
     Write-Info ("Text report written: {0}" -f $paths.reportText)
     Write-Info ("Manual reinstall list written: {0}" -f $paths.manualReinstallList)
