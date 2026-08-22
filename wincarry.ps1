@@ -14,6 +14,7 @@ Current implemented scope:
 - Config detection and safe backup
 - Restore dry-run, package-manager reinstall flow, and guarded config restore
 - Advanced guarded junction mode
+- Offline-safe backup, manifest, report, and restore blocking mode
 #>
 
 [CmdletBinding()]
@@ -68,6 +69,7 @@ $script:HelperScriptFileNames = @(
     "WinCarry.Backup.ps1",
     "WinCarry.Restore.ps1",
     "WinCarry.Junction.ps1",
+    "WinCarry.Offline.ps1",
     "WinCarry.Cli.ps1"
 )
 

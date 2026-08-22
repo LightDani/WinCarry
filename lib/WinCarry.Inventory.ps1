@@ -1212,6 +1212,7 @@ function Convert-PackageManagerStatusToMap {
             available = [bool](Get-MapValue -Map $manager -Key "available")
             version = [string](Get-MapValue -Map $manager -Key "version")
             source = [string](Get-MapValue -Map $manager -Key "source")
+            offlineSafeSkipped = [bool](Get-MapValue -Map $manager -Key "offlineSafeSkipped")
         }
         if ($name -eq "scoop") {
             $entry["root"] = (Join-Path $RootPath "scoop")
@@ -1255,14 +1256,17 @@ function Convert-AppForManifest {
 function New-AppManifestFromScan {
     param(
         [Parameter(Mandatory = $true)]
-        $Scan
+        $Scan,
+
+        [switch]$OfflineSafe
     )
 
     $rootPath = [string]$Scan.root.resolvedRoot
     $os = Get-OperatingSystemInfo
     $user = Get-CurrentUserInfo
     $admin = Get-AdminStatus
-    $packageManagers = @(Get-PackageManagerStatus)
+    $effectiveOfflineSafe = ([bool]$OfflineSafe -or [bool](Get-MapValue -Map $Scan -Key "offlineSafeMode"))
+    $packageManagers = @(Get-PackageManagerStatus -OfflineSafe:$effectiveOfflineSafe)
     $apps = @($Scan.apps | ForEach-Object { Convert-AppForManifest -App $_ -DetectedAt $Scan.createdAt })
     $manualApps = @(Get-ManualReinstallApps -Apps $apps | ForEach-Object { New-AppSummaryRecord -App $_ })
     $unsupportedApps = @(Get-UnsupportedApps -Apps $apps | ForEach-Object { New-AppSummaryRecord -App $_ })
@@ -1271,9 +1275,11 @@ function New-AppManifestFromScan {
         schemaVersion = "1.0"
         createdAt = (Get-Date).ToString("o")
         toolName = $script:ToolName
+        offlineSafeMode = [bool]$effectiveOfflineSafe
         sourceScan = [ordered]@{
             schemaVersion = [string]$Scan.schemaVersion
             createdAt = [string]$Scan.createdAt
+            offlineSafeMode = [bool](Get-MapValue -Map $Scan -Key "offlineSafeMode")
             evidenceCount = @($Scan.evidence).Count
             sourceCounts = $Scan.sources
             warnings = @($Scan.warnings)
@@ -1356,7 +1362,12 @@ function Convert-ManifestReportToMarkdown {
     $lines.Add(("Created: {0}" -f (Get-MapValue -Map $Manifest -Key "createdAt")))
     $lines.Add(("Manifest schema: {0}" -f (Get-MapValue -Map $Manifest -Key "schemaVersion")))
     $lines.Add(("WinCarry root: {0}" -f (Get-MapValue -Map $root -Key "winCarryRoot")))
+    $lines.Add(("Offline-safe mode: {0}" -f [bool](Get-MapValue -Map $Manifest -Key "offlineSafeMode")))
     $lines.Add("")
+    if ([bool](Get-MapValue -Map $Manifest -Key "offlineSafeMode")) {
+        $lines.Add("> Offline-safe mode skipped package-manager scan/status commands. Package-manager restore commands are blocked for this manifest.")
+        $lines.Add("")
+    }
     $lines.Add("> Restore confidence is a risk classification, not a success rate or guarantee.")
     $lines.Add("")
 
@@ -1393,6 +1404,10 @@ function Convert-ManifestReportToMarkdown {
         $manager = Get-MapValue -Map $packageManagers -Key $managerName
         $available = Get-MapValue -Map $manager -Key "available"
         $version = [string](Get-MapValue -Map $manager -Key "version")
+        if ([bool](Get-MapValue -Map $manager -Key "offlineSafeSkipped")) {
+            $lines.Add(("- {0}: skipped by offline-safe mode" -f $managerName))
+            continue
+        }
         if ([string]::IsNullOrWhiteSpace($version)) {
             $version = "version unknown"
         }
@@ -1487,6 +1502,10 @@ function Convert-ManifestReportToText {
     $lines.Add("")
     $lines.Add(("Created: {0}" -f (Get-MapValue -Map $Manifest -Key "createdAt")))
     $lines.Add(("Root: {0}" -f (Get-MapValue -Map $root -Key "winCarryRoot")))
+    $lines.Add(("Offline-safe mode: {0}" -f [bool](Get-MapValue -Map $Manifest -Key "offlineSafeMode")))
+    if ([bool](Get-MapValue -Map $Manifest -Key "offlineSafeMode")) {
+        $lines.Add("Offline-safe note: package-manager scan/status commands were skipped, and package-manager restore commands are blocked for this manifest.")
+    }
     $lines.Add(("Computer: {0}" -f (Get-MapValue -Map $machine -Key "computerName")))
     $lines.Add(("Windows: {0}" -f (Get-MapValue -Map $machine -Key "windowsVersion")))
     $lines.Add("")

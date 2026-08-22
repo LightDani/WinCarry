@@ -658,6 +658,10 @@ function Get-CommandVersionText {
 }
 
 function Get-PackageManagerStatus {
+    param(
+        [switch]$OfflineSafe
+    )
+
     $definitions = @(
         [ordered]@{ name = "winget"; command = "winget"; versionArgs = @("--version") },
         [ordered]@{ name = "chocolatey"; command = "choco"; versionArgs = @("--version") },
@@ -667,6 +671,18 @@ function Get-PackageManagerStatus {
     $results = @()
 
     foreach ($definition in $definitions) {
+        if ($OfflineSafe) {
+            $results += [ordered]@{
+                name = $definition.name
+                command = $definition.command
+                available = $false
+                version = "offline-safe skipped"
+                source = ""
+                offlineSafeSkipped = $true
+            }
+            continue
+        }
+
         $command = Get-Command $definition.command -ErrorAction SilentlyContinue
         $available = ($null -ne $command)
         $version = ""
@@ -683,6 +699,7 @@ function Get-PackageManagerStatus {
             available = $available
             version = $version
             source = $source
+            offlineSafeSkipped = $false
         }
     }
 

@@ -41,7 +41,7 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 help
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 setup -Root $root -DryRun
           "YES" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 setup -Root $root
-          if (@(Get-ChildItem -LiteralPath (Join-Path $root "lib") -Filter "WinCarry.*.ps1").Count -ne 10) { throw "Expected setup to copy 10 helper scripts." }
+          if (@(Get-ChildItem -LiteralPath (Join-Path $root "lib") -Filter "WinCarry.*.ps1").Count -ne 11) { throw "Expected setup to copy 11 helper scripts." }
           powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "wincarry.ps1") help
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 preflight -Root $root -DryRun
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 scan -Root $root -DryRun
@@ -59,12 +59,64 @@ jobs:
           "YES" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 manifest -Root $manifestOnlyRoot
           $manifestOnlyEntrypoint = Join-Path $manifestOnlyRoot "wincarry.ps1"
           if (-not (Test-Path -LiteralPath $manifestOnlyEntrypoint)) { throw "Expected manifest to sync wincarry.ps1 into manifest-only root." }
-          if (@(Get-ChildItem -LiteralPath (Join-Path $manifestOnlyRoot "lib") -Filter "WinCarry.*.ps1").Count -ne 10) { throw "Expected manifest to sync 10 helper scripts into manifest-only root." }
+          if (@(Get-ChildItem -LiteralPath (Join-Path $manifestOnlyRoot "lib") -Filter "WinCarry.*.ps1").Count -ne 11) { throw "Expected manifest to sync 11 helper scripts into manifest-only root." }
           $manifestOnlyRestoreOutput = @(powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $manifestOnlyRoot "restore-scripts\restore-latest.ps1") -DryRun 2>&1 | ForEach-Object { [string]$_ })
           if (-not (($manifestOnlyRestoreOutput -join "`n") -match "Manifest: .*latest\.json")) { throw "Manifest-only restore launcher did not load latest manifest." }
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 report -Root $root -DryRun
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root $root -DryRun
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 backup -Root $root -DryRun
+          $offlineRoot = Join-Path $env:RUNNER_TEMP "WinCarry-Offline"
+          $offlineFakeBin = Join-Path $env:RUNNER_TEMP "WinCarry-Offline-FakeBin"
+          $offlineInvocationPath = Join-Path $env:RUNNER_TEMP "wincarry-offline-package-manager-invocations.txt"
+          $offlineProfile = Join-Path $env:RUNNER_TEMP "WinCarry-Offline-Profile"
+          Remove-Item -LiteralPath $offlineRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $offlineFakeBin -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $offlineProfile -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $offlineInvocationPath -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $offlineRoot,$offlineFakeBin,$offlineProfile | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $offlineProfile ".ssh") | Out-Null
+          Set-Content -LiteralPath (Join-Path $offlineProfile ".gitconfig") -Value "[user]`n`tname = Offline CI" -Encoding UTF8
+          Set-Content -LiteralPath (Join-Path $offlineProfile ".ssh\id_ed25519") -Value "PRIVATE KEY" -Encoding UTF8
+          foreach ($name in @("winget", "choco", "scoop")) {
+            Set-Content -LiteralPath (Join-Path $offlineFakeBin "$name.ps1") -Encoding UTF8 -Value @'
+          param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+          Add-Content -LiteralPath $env:WINCARRY_OFFLINE_PM_LOG -Value ("{0} {1}" -f $MyInvocation.MyCommand.Name, ($Arguments -join " ")) -Encoding UTF8
+          Write-Output "offline fake package manager should not run"
+          exit 77
+          '@
+          }
+          $oldPath = $env:PATH
+          $oldUserProfile = $env:USERPROFILE
+          $oldHome = $env:HOME
+          $env:WINCARRY_OFFLINE_PM_LOG = $offlineInvocationPath
+          $env:PATH = "$offlineFakeBin;$env:PATH"
+          $env:USERPROFILE = $offlineProfile
+          $env:HOME = $offlineProfile
+          $offlineDryRunOutput = @(powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 offline -Root $offlineRoot -DryRun 2>&1 | ForEach-Object { [string]$_ })
+          $offlineDryRunText = $offlineDryRunOutput -join "`n"
+          if ($offlineDryRunText -notmatch "Offline-safe mode: True") { throw "Offline dry-run did not report offline-safe mode." }
+          if ($offlineDryRunText -notmatch "package-manager scan skipped by offline-safe mode") { throw "Offline dry-run did not report skipped package-manager scans." }
+          if (Test-Path -LiteralPath $offlineInvocationPath) { throw "Offline dry-run invoked a package manager." }
+          "`nYES`nYES`n" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 offline -Root $offlineRoot
+          if (Test-Path -LiteralPath $offlineInvocationPath) { throw "Offline non-dry invoked a package manager." }
+          $offlineBackup = Get-Content -Raw -LiteralPath (Join-Path $offlineRoot "backups\latest-config-backup.json") | ConvertFrom-Json
+          if (-not ([int]$offlineBackup.summary.backedUp -ge 1)) { throw "Offline mode did not write config backup metadata." }
+          $offlineManifest = Get-Content -Raw -LiteralPath (Join-Path $offlineRoot "manifests\latest.json") | ConvertFrom-Json
+          if (-not [bool]$offlineManifest.offlineSafeMode) { throw "Offline manifest did not set offlineSafeMode." }
+          if (-not [bool]$offlineManifest.packageManagers.winget.offlineSafeSkipped) { throw "Offline manifest did not mark winget status as skipped." }
+          $offlineReport = Get-ChildItem -LiteralPath (Join-Path $offlineRoot "reports") -Filter "scan-*.md" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($null -eq $offlineReport) { throw "Offline mode did not write a scan report." }
+          $offlineReportText = Get-Content -Raw -LiteralPath $offlineReport.FullName
+          if ($offlineReportText -notmatch "Offline-safe mode: True") { throw "Offline report did not mark offline-safe mode." }
+          $offlineRestoreOutput = @(powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root $offlineRoot -DryRun 2>&1 | ForEach-Object { [string]$_ })
+          $offlineRestoreText = $offlineRestoreOutput -join "`n"
+          if ($offlineRestoreText -notmatch "Offline-safe mode: True") { throw "Offline restore dry-run did not report offline-safe mode." }
+          if ($offlineRestoreText -notmatch "Planned install commands: 0") { throw "Offline restore dry-run planned install commands." }
+          if ($offlineRestoreText -notmatch "package-manager restore commands are blocked") { throw "Offline restore dry-run did not explain blocked package-manager commands." }
+          if (Test-Path -LiteralPath $offlineInvocationPath) { throw "Offline restore dry-run invoked a package manager." }
+          $env:PATH = $oldPath
+          $env:USERPROFILE = $oldUserProfile
+          $env:HOME = $oldHome
           $junctionRoot = Join-Path $env:RUNNER_TEMP "WinCarry-Junction"
           $junctionSource = Join-Path $env:RUNNER_TEMP "WinCarry-Junction-Source"
           $junctionTarget = Join-Path $junctionRoot "targets\source"

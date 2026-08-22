@@ -119,11 +119,10 @@ function Show-Help {
     Write-Host "  .\wincarry.ps1 report [-Root D:\WinCarry] [-DryRun]"
     Write-Host "  .\wincarry.ps1 backup [-Root D:\WinCarry] [-DryRun]"
     Write-Host "  .\wincarry.ps1 restore [-Root D:\WinCarry] [-Manifest path] [-DryRun]"
-    Write-Host "  .\wincarry.ps1 offline"
+    Write-Host "  .\wincarry.ps1 offline [-Root D:\WinCarry] [-DryRun]"
     Write-Host "  .\wincarry.ps1 junction [-Root D:\WinCarry] [-DryRun]"
     Write-Host ""
-    Write-Host "Implemented: CLI shell, setup, preflight, app detection/classification, manifests, reports, restore scripts, config backup, package-manager restore, guarded config restore, and advanced junction mode."
-    Write-Host "Offline currently shows a placeholder and makes no changes."
+    Write-Host "Implemented: CLI shell, setup, preflight, app detection/classification, manifests, reports, restore scripts, config backup, package-manager restore, guarded config restore, advanced junction mode, and offline-safe mode."
 }
 
 function Show-MainMenu {
@@ -204,7 +203,13 @@ function Show-MainMenu {
                 }
                 Invoke-Junction -RootPath $rootInput
             }
-            "9" { Show-CommandPlaceholder -CommandName "offline" -Phase "Phase 11" }
+            "9" {
+                $rootInput = Read-Host ("WinCarry root [{0}]" -f $script:DefaultRoot)
+                if ([string]::IsNullOrWhiteSpace($rootInput)) {
+                    $rootInput = $script:DefaultRoot
+                }
+                Invoke-Offline -RootPath $rootInput
+            }
             "0" {
                 Write-Host ""
                 Write-Info "Goodbye."
@@ -241,7 +246,7 @@ function Invoke-CommandRouter {
         "manifest" { Invoke-Manifest -RootPath $Root -DryRunOnly:$DryRun }
         "restore" { Invoke-Restore -RootPath $Root -ManifestPath $Manifest -DryRunOnly:$DryRun }
         "report" { Invoke-Report -RootPath $Root -DryRunOnly:$DryRun }
-        "offline" { Show-CommandPlaceholder -CommandName "offline" -Phase "Phase 11" }
+        "offline" { Invoke-Offline -RootPath $Root -DryRunOnly:$DryRun }
         "junction" { Invoke-Junction -RootPath $Root -DryRunOnly:$DryRun }
         "help" { Show-Help }
     }

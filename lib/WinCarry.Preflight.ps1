@@ -1,19 +1,22 @@
 function New-PreflightSnapshot {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$RootPath
+        [string]$RootPath,
+
+        [switch]$OfflineSafe
     )
 
     return [ordered]@{
         createdAt = (Get-Date).ToString("o")
         toolName = $script:ToolName
         scriptPath = (Resolve-DisplayPath -Path (Get-CurrentScriptPath))
+        offlineSafeMode = [bool]$OfflineSafe
         root = (Get-RootValidation -RootPath $RootPath)
         os = (Get-OperatingSystemInfo)
         user = (Get-CurrentUserInfo)
         admin = (Get-AdminStatus)
         drives = @(Get-FileSystemDrives)
-        packageManagers = @(Get-PackageManagerStatus)
+        packageManagers = @(Get-PackageManagerStatus -OfflineSafe:$OfflineSafe)
     }
 }
 
@@ -28,6 +31,7 @@ function Convert-PreflightSnapshotToMarkdown {
     $lines.Add("")
     $lines.Add(("Created: {0}" -f $Snapshot.createdAt))
     $lines.Add(("Script: {0}" -f $Snapshot.scriptPath))
+    $lines.Add(("Offline-safe mode: {0}" -f $Snapshot.offlineSafeMode))
     $lines.Add("")
     $lines.Add("## Root")
     $lines.Add("")
@@ -89,6 +93,8 @@ function Convert-PreflightSnapshotToMarkdown {
                 $versionText = "version unknown"
             }
             $lines.Add(("- {0}: available ({1}) at {2}" -f $manager.name, $versionText, $manager.source))
+        } elseif ($manager.offlineSafeSkipped) {
+            $lines.Add(("- {0}: skipped by offline-safe mode" -f $manager.name))
         } else {
             $lines.Add(("- {0}: not found" -f $manager.name))
         }
@@ -108,6 +114,7 @@ function Show-PreflightSnapshot {
     Write-Host ""
     Write-Host ("Created: {0}" -f $Snapshot.createdAt)
     Write-Host ("Script: {0}" -f $Snapshot.scriptPath)
+    Write-Host ("Offline-safe mode: {0}" -f $Snapshot.offlineSafeMode)
     Write-Host ""
     Write-Host "Root"
     Write-Host ("- Requested: {0}" -f $Snapshot.root.requestedRoot)
@@ -157,6 +164,8 @@ function Show-PreflightSnapshot {
                 $versionText = "version unknown"
             }
             Write-Host ("- {0}: available ({1})" -f $manager.name, $versionText)
+        } elseif ($manager.offlineSafeSkipped) {
+            Write-Host ("- {0}: skipped by offline-safe mode" -f $manager.name)
         } else {
             Write-Host ("- {0}: not found" -f $manager.name)
         }

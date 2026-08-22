@@ -239,6 +239,19 @@ function Get-ScoopEvidence {
     }
 }
 
+
+function New-OfflineSkippedScanResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceName
+    )
+
+    return [ordered]@{
+        records = @()
+        warnings = @(("{0} package-manager scan skipped by offline-safe mode." -f $SourceName))
+    }
+}
+
 function Get-StartMenuShortcutEvidence {
     $records = @()
     $warnings = @()
@@ -393,7 +406,9 @@ function Add-ScanSourceResult {
 function New-AppScanSnapshot {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$RootPath
+        [string]$RootPath,
+
+        [switch]$OfflineSafe
     )
 
     $resolvedRoot = Resolve-DisplayPath -Path $RootPath
@@ -401,6 +416,7 @@ function New-AppScanSnapshot {
         schemaVersion = "raw-scan.1"
         createdAt = (Get-Date).ToString("o")
         toolName = $script:ToolName
+        offlineSafeMode = [bool]$OfflineSafe
         scriptPath = (Resolve-DisplayPath -Path (Get-CurrentScriptPath))
         root = [ordered]@{
             requestedRoot = $RootPath
@@ -420,9 +436,16 @@ function New-AppScanSnapshot {
     }
 
     Add-ScanSourceResult -Scan $scan -SourceName "registry" -Result (Get-RegistryUninstallEvidence)
-    Add-ScanSourceResult -Scan $scan -SourceName "winget" -Result (Get-WingetEvidence)
-    Add-ScanSourceResult -Scan $scan -SourceName "chocolatey" -Result (Get-ChocolateyEvidence)
-    Add-ScanSourceResult -Scan $scan -SourceName "scoop" -Result (Get-ScoopEvidence)
+    if ($OfflineSafe) {
+        $scan.notes += "Offline-safe mode skipped package-manager scan commands."
+        Add-ScanSourceResult -Scan $scan -SourceName "winget" -Result (New-OfflineSkippedScanResult -SourceName "winget")
+        Add-ScanSourceResult -Scan $scan -SourceName "chocolatey" -Result (New-OfflineSkippedScanResult -SourceName "chocolatey")
+        Add-ScanSourceResult -Scan $scan -SourceName "scoop" -Result (New-OfflineSkippedScanResult -SourceName "scoop")
+    } else {
+        Add-ScanSourceResult -Scan $scan -SourceName "winget" -Result (Get-WingetEvidence)
+        Add-ScanSourceResult -Scan $scan -SourceName "chocolatey" -Result (Get-ChocolateyEvidence)
+        Add-ScanSourceResult -Scan $scan -SourceName "scoop" -Result (Get-ScoopEvidence)
+    }
     Add-ScanSourceResult -Scan $scan -SourceName "startMenu" -Result (Get-StartMenuShortcutEvidence)
     Add-ScanSourceResult -Scan $scan -SourceName "knownFolder" -Result (Get-KnownFolderEvidence -RootPath $resolvedRoot)
 
@@ -443,6 +466,7 @@ function Show-AppScanSummary {
     Write-Host ""
     Write-Host ("Created: {0}" -f $Scan.createdAt)
     Write-Host ("Root: {0}" -f $Scan.root.resolvedRoot)
+    Write-Host ("Offline-safe mode: {0}" -f $Scan.offlineSafeMode)
     Write-Host ""
     Write-Host "Sources"
 

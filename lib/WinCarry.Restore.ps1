@@ -1203,7 +1203,9 @@ function New-RestorePlan {
         [AllowEmptyCollection()]
         [object[]]$SelectedApps,
 
-        [string[]]$Warnings = @()
+        [string[]]$Warnings = @(),
+
+        [switch]$OfflineSafe
     )
 
     $apps = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "apps"))
@@ -1224,6 +1226,11 @@ function New-RestorePlan {
 
         if (-not $isRestorable) {
             $skipped += New-RestoreSkippedRecord -App $app -Reason "Not eligible for automatic package-manager restore."
+            continue
+        }
+
+        if ($OfflineSafe) {
+            $skipped += New-RestoreSkippedRecord -App $app -Reason "Offline-safe mode blocks package-manager restore commands."
             continue
         }
 
@@ -1259,6 +1266,7 @@ function New-RestorePlan {
         currentRoot = $RootPath
         selectionMode = $SelectionMode
         versionPolicy = $VersionPolicy
+        offlineSafeMode = [bool]$OfflineSafe
         warnings = @($Warnings)
         preflight = $Preflight
         packageManagers = $packageManagerMap
@@ -1315,6 +1323,7 @@ function Show-RestorePlan {
     Write-Host ("Current root: {0}" -f (Get-MapValue -Map $Plan -Key "currentRoot"))
     Write-Host ("Selection mode: {0}" -f (Get-MapValue -Map $Plan -Key "selectionMode"))
     Write-Host ("Version policy: {0}" -f (Get-MapValue -Map $Plan -Key "versionPolicy"))
+    Write-Host ("Offline-safe mode: {0}" -f (Get-MapValue -Map $Plan -Key "offlineSafeMode"))
 
     foreach ($warning in @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Plan -Key "warnings"))) {
         Write-WarningText $warning
@@ -1340,6 +1349,10 @@ function Show-RestorePlan {
     foreach ($managerName in (Get-ObjectKeys -Object (Get-MapValue -Map $Plan -Key "packageManagers") | Sort-Object)) {
         $manager = Get-MapValue -Map (Get-MapValue -Map $Plan -Key "packageManagers") -Key $managerName
         $version = [string](Get-MapValue -Map $manager -Key "version")
+        if ([bool](Get-MapValue -Map $manager -Key "offlineSafeSkipped")) {
+            Write-Host ("- {0}: skipped by offline-safe mode" -f $managerName)
+            continue
+        }
         if ([string]::IsNullOrWhiteSpace($version)) {
             $version = "version unknown"
         }
@@ -1501,6 +1514,10 @@ function Convert-RestoreReportToMarkdown {
     foreach ($managerName in (Get-ObjectKeys -Object (Get-MapValue -Map $Plan -Key "packageManagers") | Sort-Object)) {
         $manager = Get-MapValue -Map (Get-MapValue -Map $Plan -Key "packageManagers") -Key $managerName
         $version = [string](Get-MapValue -Map $manager -Key "version")
+        if ([bool](Get-MapValue -Map $manager -Key "offlineSafeSkipped")) {
+            $lines.Add(("- {0}: skipped by offline-safe mode" -f $managerName))
+            continue
+        }
         if ([string]::IsNullOrWhiteSpace($version)) {
             $version = "version unknown"
         }
@@ -1628,8 +1645,12 @@ function Invoke-Restore {
         return
     }
 
-    $preflight = New-PreflightSnapshot -RootPath $resolvedRoot
+    $manifestOfflineSafe = [bool](Get-MapValue -Map $manifest -Key "offlineSafeMode")
+    $preflight = New-PreflightSnapshot -RootPath $resolvedRoot -OfflineSafe:$manifestOfflineSafe
     $warnings = @()
+    if ($manifestOfflineSafe) {
+        $warnings += "Manifest is offline-safe; package-manager restore commands are blocked."
+    }
     foreach ($warning in @(ConvertTo-ArrayValue -Value $preflight.root.warnings)) {
         $warnings += $warning
     }
@@ -1653,7 +1674,11 @@ function Invoke-Restore {
         }
     }
 
-    if ($DryRunOnly) {
+    if ($manifestOfflineSafe) {
+        $selectionMode = "offline-safe"
+        $versionPolicy = "blocked"
+        $selectedApps = @()
+    } elseif ($DryRunOnly) {
         $selectionMode = "package-manager"
         $versionPolicy = "latest"
         $selectedApps = @(Select-RestoreApps -Manifest $manifest -SelectionMode $selectionMode)
@@ -1671,10 +1696,10 @@ function Invoke-Restore {
     $reportPath = Get-RestoreReportPath -RootPath $resolvedRoot -Timestamp $timestamp
     $logPath = Get-LogPath -RootPath $resolvedRoot
     $existingConfigBackupRoot = Get-ConfigRestoreExistingBackupRootPath -RootPath $resolvedRoot -Timestamp $timestamp
-    $currentScan = New-AppScanSnapshot -RootPath $resolvedRoot
+    $currentScan = New-AppScanSnapshot -RootPath $resolvedRoot -OfflineSafe:$manifestOfflineSafe
     $currentApps = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $currentScan -Key "apps"))
 
-    $plan = New-RestorePlan -Manifest $manifest -Preflight $preflight -ManifestPath $restoreManifestPath -RootPath $resolvedRoot -SelectionMode $selectionMode -VersionPolicy $versionPolicy -SelectedApps $selectedApps -Warnings $warnings
+    $plan = New-RestorePlan -Manifest $manifest -Preflight $preflight -ManifestPath $restoreManifestPath -RootPath $resolvedRoot -SelectionMode $selectionMode -VersionPolicy $versionPolicy -SelectedApps $selectedApps -Warnings $warnings -OfflineSafe:$manifestOfflineSafe
     $configPreview = New-ConfigRestorePlan -Manifest $manifest -ConflictPolicy "missing-only" -ExistingBackupRootPath $existingConfigBackupRoot -CurrentApps $currentApps
     Set-MapValue -Map $plan -Key "configRestore" -Value $configPreview
     Show-RestorePlan -Plan $plan

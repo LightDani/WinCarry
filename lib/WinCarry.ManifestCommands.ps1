@@ -17,6 +17,7 @@ function Show-ManifestPlan {
     Write-Host ("Apps: {0}" -f (Get-MapValue -Map $summary -Key "appCount"))
     Write-Host ("Manual reinstall / review: {0}" -f (Get-MapValue -Map $summary -Key "manualReinstallCount"))
     Write-Host ("Unsupported / do not restore automatically: {0}" -f (Get-MapValue -Map $summary -Key "unsupportedCount"))
+    Write-Host ("Offline-safe mode: {0}" -f [bool](Get-MapValue -Map $Manifest -Key "offlineSafeMode"))
     Write-Host ""
     Write-Host "Will write:"
 
