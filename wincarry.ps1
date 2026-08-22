@@ -1948,8 +1948,8 @@ function ConvertTo-ArrayValue {
 function Get-AppPackages {
     param($App)
 
-    $packages = ConvertTo-ArrayValue -Value (Get-MapValue -Map $App -Key "packages")
-    if ($packages.Count -gt 0) {
+    $packages = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $App -Key "packages"))
+    if (@($packages).Count -gt 0) {
         return @($packages)
     }
 

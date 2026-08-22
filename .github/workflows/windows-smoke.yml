@@ -125,26 +125,36 @@ jobs:
           }
           Set-Content -LiteralPath (Join-Path $restoreRoot "manifests\latest.json") -Value ($manifest | ConvertTo-Json -Depth 12) -Encoding UTF8
 
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root $restoreRoot -DryRun
+          $dryRunOutput = @(powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root $restoreRoot -DryRun 2>&1 | ForEach-Object { [string]$_ })
+          $dryRunOutput | Write-Host
+          $dryRunText = $dryRunOutput -join "`n"
+          Assert-True ($dryRunText -match "Package-manager candidates: 3") "Dry-run restore should find three package-manager candidates."
           Assert-True (-not (Get-ChildItem -LiteralPath (Join-Path $restoreRoot "reports") -Filter "restore-*.md" -ErrorAction SilentlyContinue)) "Dry-run restore should not write restore reports."
 
           $fakeBin = Join-Path $env:RUNNER_TEMP "WinCarry-FakeBin"
           New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null
           $invocationPath = Join-Path $env:RUNNER_TEMP "wincarry-restore-invocations.txt"
           Remove-Item -LiteralPath $invocationPath -Force -ErrorAction SilentlyContinue
-          $fakeWinget = Join-Path $fakeBin "winget.cmd"
-          Set-Content -LiteralPath $fakeWinget -Encoding ASCII -Value @(
-            '@echo off',
-            'if "%1"=="--version" (',
-            '  echo v-test',
-            '  exit /b 0',
-            ')',
-            ('echo %*>>"{0}"' -f $invocationPath),
-            'echo %* | findstr /C:"Fail.App" >nul',
-            'if not errorlevel 1 exit /b 9',
-            'exit /b 0'
-          )
+          $fakeWinget = Join-Path $fakeBin "winget.ps1"
+          Set-Content -LiteralPath $fakeWinget -Encoding UTF8 -Value @'
+          param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+
+          if ($Arguments.Count -eq 1 -and $Arguments[0] -eq "--version") {
+            Write-Output "v-test"
+            exit 0
+          }
+
+          Add-Content -LiteralPath $env:WINCARRY_FAKE_WINGET_LOG -Value ($Arguments -join " ") -Encoding UTF8
+          if (($Arguments -join " ") -match "Fail\.App") {
+            exit 9
+          }
+
+          exit 0
+          '@
+          $env:WINCARRY_FAKE_WINGET_LOG = $invocationPath
           $env:PATH = "$fakeBin;$env:PATH"
+          $wingetCommand = Get-Command winget -ErrorAction Stop
+          Assert-True ([string]$wingetCommand.Source -eq [string]$fakeWinget) "Expected restore fixture to use fake winget at $fakeWinget, got $($wingetCommand.Source)."
 
           "3`n2`n1,2`nYES`n" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root $restoreRoot
 
