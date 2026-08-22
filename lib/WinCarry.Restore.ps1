@@ -71,6 +71,46 @@ function Test-SameDisplayPath {
     return [string]::Equals($leftPath, $rightPath, [StringComparison]::Ordinal)
 }
 
+
+function Get-RestoreManifestFileRoot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestPath
+    )
+
+    $resolvedManifestPath = Resolve-DisplayPath -Path $ManifestPath
+    if ([string]::IsNullOrWhiteSpace($resolvedManifestPath)) {
+        return ""
+    }
+
+    $manifestDirectory = Split-Path -Parent $resolvedManifestPath
+    if ([string]::IsNullOrWhiteSpace($manifestDirectory)) {
+        return ""
+    }
+
+    if ([string]::Equals((Split-Path -Leaf $manifestDirectory), "manifests", [StringComparison]::OrdinalIgnoreCase)) {
+        return (Resolve-DisplayPath -Path (Split-Path -Parent $manifestDirectory))
+    }
+
+    return ""
+}
+
+function Get-EffectiveRestoreManifestRoot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestPath,
+
+        [string]$MetadataRoot
+    )
+
+    $fileRoot = Get-RestoreManifestFileRoot -ManifestPath $ManifestPath
+    if (-not [string]::IsNullOrWhiteSpace($fileRoot)) {
+        return $fileRoot
+    }
+
+    return $MetadataRoot
+}
+
 function Get-ManifestWinCarryRoot {
     param($Manifest)
 
@@ -1214,7 +1254,8 @@ function New-RestorePlan {
         createdAt = (Get-Date).ToString("o")
         manifestPath = $ManifestPath
         manifestCreatedAt = [string](Get-MapValue -Map $Manifest -Key "createdAt")
-        manifestRoot = (Get-ManifestWinCarryRoot -Manifest $Manifest)
+        manifestRoot = (Get-EffectiveRestoreManifestRoot -ManifestPath $ManifestPath -MetadataRoot (Get-ManifestWinCarryRoot -Manifest $Manifest))
+        manifestMetadataRoot = (Get-ManifestWinCarryRoot -Manifest $Manifest)
         currentRoot = $RootPath
         selectionMode = $SelectionMode
         versionPolicy = $VersionPolicy
@@ -1593,17 +1634,17 @@ function Invoke-Restore {
         $warnings += $warning
     }
 
-    $manifestRoot = Get-ManifestWinCarryRoot -Manifest $manifest
+    $manifestFileRoot = Get-RestoreManifestFileRoot -ManifestPath $restoreManifestPath
     $rootMismatch = $false
-    if (-not [string]::IsNullOrWhiteSpace($manifestRoot) -and -not (Test-SameDisplayPath -Left $manifestRoot -Right $resolvedRoot)) {
+    if (-not [string]::IsNullOrWhiteSpace($manifestFileRoot) -and -not (Test-SameDisplayPath -Left $manifestFileRoot -Right $resolvedRoot)) {
         $rootMismatch = $true
-        $warnings += ("Manifest root differs from current root. Manifest={0}; current={1}." -f $manifestRoot, $resolvedRoot)
+        $warnings += ("Manifest file is outside the current WinCarry root. Manifest file root={0}; current={1}." -f $manifestFileRoot, $resolvedRoot)
     }
 
     if ($rootMismatch -and -not $DryRunOnly) {
         Write-Host ""
-        Write-WarningText "The manifest was created for a different WinCarry root path."
-        Write-WarningText ("Manifest root: {0}" -f $manifestRoot)
+        Write-WarningText "The selected manifest file is outside the current WinCarry root path."
+        Write-WarningText ("Manifest file root: {0}" -f $manifestFileRoot)
         Write-WarningText ("Current root: {0}" -f $resolvedRoot)
         if (-not (Read-RequiredConfirmation -Prompt "Continue restore using the current root?")) {
             Write-Host ""
