@@ -1,0 +1,209 @@
+{
+  "schemaVersion": "1.0",
+  "createdAt": "2026-08-23T09:00:00+07:00",
+  "toolName": "WinCarry",
+  "offlineSafeMode": false,
+  "sourceScan": {
+    "schemaVersion": "raw-scan.1",
+    "createdAt": "2026-08-23T08:58:00+07:00",
+    "offlineSafeMode": false,
+    "evidenceCount": 6,
+    "sourceCounts": {
+      "registry": {
+        "count": 2,
+        "warnings": []
+      },
+      "winget": {
+        "count": 2,
+        "warnings": []
+      },
+      "chocolatey": {
+        "count": 0,
+        "warnings": [
+          "Chocolatey not found."
+        ]
+      },
+      "scoop": {
+        "count": 0,
+        "warnings": [
+          "Scoop not found."
+        ]
+      },
+      "startMenu": {
+        "count": 2,
+        "warnings": []
+      },
+      "knownFolder": {
+        "count": 0,
+        "warnings": []
+      }
+    },
+    "warnings": []
+  },
+  "machine": {
+    "computerName": "SAMPLE-PC",
+    "windowsVersion": "Microsoft Windows 11 64-bit",
+    "osCaption": "Microsoft Windows 11",
+    "osVersion": "10.0.26100",
+    "architecture": "64-bit",
+    "userName": "sample-user",
+    "userDomain": "SAMPLE-PC",
+    "userProfile": "C:\\Users\\sample-user",
+    "isAdmin": false
+  },
+  "root": {
+    "winCarryRoot": "D:\\WinCarry"
+  },
+  "packageManagers": {
+    "winget": {
+      "available": true,
+      "version": "v1.11.0",
+      "source": "C:\\Users\\sample-user\\AppData\\Local\\Microsoft\\WindowsApps\\winget.exe",
+      "offlineSafeSkipped": false
+    },
+    "chocolatey": {
+      "available": false,
+      "version": "",
+      "source": "",
+      "offlineSafeSkipped": false
+    },
+    "scoop": {
+      "available": false,
+      "version": "",
+      "source": "",
+      "offlineSafeSkipped": false,
+      "root": "D:\\WinCarry\\scoop"
+    }
+  },
+  "summary": {
+    "appCount": 3,
+    "evidenceCount": 6,
+    "classificationSummary": {
+      "Winget reinstallable": 1,
+      "Installer-based / manual reinstall": 1,
+      "Unsupported / risky": 1
+    },
+    "restoreConfidenceSummary": {
+      "Medium": 1,
+      "Low": 1,
+      "Unsupported": 1
+    },
+    "manualReinstallCount": 1,
+    "unsupportedCount": 1
+  },
+  "apps": [
+    {
+      "id": "app-git-sample",
+      "name": "Git",
+      "publisher": "The Git Development Community",
+      "versionDetected": "2.45.0",
+      "installLocation": "C:\\Program Files\\Git",
+      "executablePath": "C:\\Program Files\\Git\\cmd\\git.exe",
+      "sources": [
+        "registry",
+        "winget",
+        "startMenu"
+      ],
+      "package": {
+        "manager": "winget",
+        "id": "Git.Git",
+        "version": "2.45.0",
+        "source": "winget"
+      },
+      "packages": [
+        {
+          "manager": "winget",
+          "id": "Git.Git",
+          "version": "2.45.0",
+          "source": "winget"
+        }
+      ],
+      "classification": "Winget reinstallable",
+      "restoreConfidence": "Medium",
+      "restoreStrategy": "reinstall-via-package-manager",
+      "reasons": [
+        "Found winget package metadata.",
+        "Evidence sources: registry, startMenu, winget."
+      ],
+      "warnings": [],
+      "configPaths": [
+        {
+          "name": "Git global config",
+          "type": "safe",
+          "restorePathTemplate": "%USERPROFILE%\\.gitconfig",
+          "backupStatus": "backed_up"
+        }
+      ],
+      "evidenceCount": 3
+    },
+    {
+      "id": "app-manual-sample",
+      "name": "Example Manual App",
+      "publisher": "Example Vendor",
+      "versionDetected": "1.0.0",
+      "sources": [
+        "registry"
+      ],
+      "packages": [],
+      "classification": "Installer-based / manual reinstall",
+      "restoreConfidence": "Low",
+      "restoreStrategy": "manual-reinstall",
+      "reasons": [
+        "Found uninstall registry metadata but no package-manager identity."
+      ],
+      "warnings": [],
+      "configPaths": [],
+      "evidenceCount": 1
+    },
+    {
+      "id": "app-runtime-sample",
+      "name": "Example Runtime Component",
+      "publisher": "Example Vendor",
+      "versionDetected": "14.0.0",
+      "sources": [
+        "registry"
+      ],
+      "packages": [],
+      "classification": "Unsupported / risky",
+      "restoreConfidence": "Unsupported",
+      "restoreStrategy": "do-not-restore",
+      "reasons": [
+        "Runtime or SDK dependency should be installed by Windows, apps, or package managers as needed."
+      ],
+      "warnings": [],
+      "configPaths": [],
+      "evidenceCount": 1
+    }
+  ],
+  "manualReinstall": [
+    {
+      "name": "Example Manual App",
+      "classification": "Installer-based / manual reinstall",
+      "restoreConfidence": "Low",
+      "restoreStrategy": "manual-reinstall",
+      "package": "manual"
+    }
+  ],
+  "unsupported": [
+    {
+      "name": "Example Runtime Component",
+      "classification": "Unsupported / risky",
+      "restoreConfidence": "Unsupported",
+      "restoreStrategy": "do-not-restore",
+      "package": "manual"
+    }
+  ],
+  "configBackups": [
+    {
+      "createdAt": "2026-08-23T08:55:00+07:00",
+      "backupRoot": "D:\\WinCarry\\backups\\2026-08-23_0855",
+      "includeSensitive": false,
+      "summary": {
+        "backedUp": 1,
+        "skippedSensitive": 1,
+        "detectOnly": 0
+      }
+    }
+  ],
+  "unmatchedConfigPaths": []
+}

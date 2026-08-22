@@ -1,149 +1,258 @@
 # WinCarry
 
-WinCarry is an early-stage PowerShell toolkit for reducing Windows reinstall friction.
+WinCarry is a PowerShell toolkit for preparing a Windows reinstall and reducing the work needed after the new Windows installation is ready.
 
-It is intended to help users prepare for a Windows reinstall by scanning apps, generating manifests, backing up selected configuration, and later restoring/reinstalling selected apps through safe workflows.
+This tool helps prepare and restore applications/configuration after Windows reinstall.
+It does not guarantee that every application will work without reinstall, repair, login, or activation.
 
-Current status: alpha. The CLI skeleton, setup flow, preflight system snapshot, and raw app detection scan are implemented.
+WinCarry is currently alpha software. Read every dry-run plan before allowing a write, and keep an external copy of the WinCarry root before reinstalling Windows.
 
-## What It Does Not Guarantee
+## What WinCarry Does
 
-WinCarry does not guarantee that every application will work after Windows reinstall without reinstall, repair, login, activation, registry registration, service setup, or driver setup.
+WinCarry can:
 
-The project intentionally avoids dangerous global Windows modifications such as changing `ProgramFilesDir` or treating symlinks/junctions as a universal app migration strategy.
+- Create a portable WinCarry root folder, defaulting to `D:\WinCarry`.
+- Capture a preflight system snapshot.
+- Scan installed applications from local evidence sources.
+- Deduplicate app evidence into logical app records.
+- Classify apps by conservative restore strategy.
+- Generate reinstall manifests and human-readable reports.
+- Back up selected user configuration files.
+- Generate restore launcher scripts under `restore-scripts`.
+- Reinstall selected package-manager apps through `winget`, Chocolatey, or Scoop.
+- Restore backed-up config files with conflict handling.
+- Run an offline-safe workflow that skips package-manager scan/status/install commands.
+- Create guarded directory junctions for advanced manual workflows.
 
-## Current Scope
+## What WinCarry Does Not Guarantee
 
-Implemented:
+WinCarry does not guarantee that every application will work after Windows reinstall without reinstall, repair, login, activation, registry registration, service setup, driver setup, data migration, or account re-authentication.
 
-- `wincarry.ps1` CLI entry point
-- interactive menu
-- direct command routing
-- `setup` command
-- root folder creation
-- initial `config/settings.json`
-- basic logging
-- dry-run output
-- explicit `YES` confirmation before filesystem changes
-- `preflight` system snapshot:
-  - OS/version/architecture
-  - current user and profile path
-  - admin/root status
-  - file-system drives and free space
-  - package manager availability for `winget`, Chocolatey, and Scoop
-  - root/protected-path validation
-  - report/log output when the WinCarry root has been set up
-- `scan` raw app detection:
-  - registry uninstall keys on Windows
-  - `winget list`
-  - `choco list --local-only`
-  - `scoop list`
-  - Start Menu shortcuts
-  - known folders as supporting evidence only
-  - raw JSON output when the WinCarry root has been set up
+It intentionally avoids dangerous global Windows changes such as rewriting `ProgramFilesDir` or treating symlinks/junctions as a universal app migration strategy.
 
-Commands planned for later phases currently show placeholders and make no changes:
+## Requirements
 
-- `backup`
-- `manifest`
-- `restore`
-- `report`
-- `offline`
-- `junction`
+- Windows for real scan, restore, and junction workflows.
+- Windows PowerShell 5.1 or PowerShell 7+.
+- Optional package managers, depending on what you want to restore:
+  - `winget`
+  - Chocolatey (`choco`)
+  - Scoop (`scoop`)
 
-## Usage
+Linux with PowerShell 7 can run parser and limited smoke checks, but it cannot reproduce Windows registry, Start Menu, package-manager, or junction behavior.
 
-Show help:
+## Usage Examples
+
+From the repository directory:
 
 ```powershell
-.\wincarry.ps1 help
-```
-
-Run the interactive menu:
-
-```powershell
-.\wincarry.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 help
 ```
 
 Preview setup:
 
 ```powershell
-.\wincarry.ps1 setup -Root "D:\WinCarry" -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 setup -Root "D:\WinCarry" -DryRun
 ```
 
-Run setup:
+Create the WinCarry root:
 
 ```powershell
-.\wincarry.ps1 setup -Root "D:\WinCarry"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 setup -Root "D:\WinCarry"
 ```
 
-Setup requires typing `YES` before it changes files.
+Type `YES` when the plan is correct.
 
-Run preflight:
+Prepare a reinstall manifest and reports:
 
 ```powershell
-.\wincarry.ps1 preflight -Root "D:\WinCarry"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 manifest -Root "D:\WinCarry" -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 manifest -Root "D:\WinCarry"
 ```
 
-Preview preflight without writing a report or log:
+Back up known configuration files:
 
 ```powershell
-.\wincarry.ps1 preflight -Root "D:\WinCarry" -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 backup -Root "D:\WinCarry" -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 backup -Root "D:\WinCarry"
 ```
 
-Run a raw app detection scan:
+Sensitive files are skipped by default. Type `INCLUDE` only if you intentionally want to back up sensitive files such as private keys or token-bearing config files.
+
+After Windows reinstall, run from the preserved WinCarry root:
 
 ```powershell
-.\wincarry.ps1 scan -Root "D:\WinCarry"
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\WinCarry\restore-scripts\restore-latest.ps1 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\WinCarry\restore-scripts\restore-latest.ps1
 ```
 
-Preview scan without writing raw JSON or a log:
+## Commands
+
+```text
+.\wincarry.ps1
+.\wincarry.ps1 setup [-Root D:\WinCarry] [-DryRun]
+.\wincarry.ps1 preflight [-Root D:\WinCarry] [-DryRun]
+.\wincarry.ps1 scan [-Root D:\WinCarry] [-DryRun]
+.\wincarry.ps1 backup [-Root D:\WinCarry] [-DryRun]
+.\wincarry.ps1 manifest [-Root D:\WinCarry] [-DryRun]
+.\wincarry.ps1 report [-Root D:\WinCarry] [-DryRun]
+.\wincarry.ps1 restore [-Root D:\WinCarry] [-Manifest path] [-DryRun]
+.\wincarry.ps1 offline [-Root D:\WinCarry] [-DryRun]
+.\wincarry.ps1 junction [-Root D:\WinCarry] [-DryRun]
+.\wincarry.ps1 help
+```
+
+All modifying workflows print a plan first and require an explicit `YES` before changing files. Use `-DryRun` first.
+
+## Typical Workflow Before Reinstall
+
+1. Clone or download WinCarry.
+2. Run `setup -Root "D:\WinCarry"`.
+3. Run `preflight` and review the report.
+4. Run `manifest -DryRun`, then `manifest`.
+5. Run `backup -DryRun`, then `backup`.
+6. Review files under:
+   - `D:\WinCarry\manifests`
+   - `D:\WinCarry\reports`
+   - `D:\WinCarry\backups`
+   - `D:\WinCarry\restore-scripts`
+7. Copy or keep the entire WinCarry root somewhere that survives the Windows reinstall.
+
+## Typical Workflow After Reinstall
+
+1. Install PowerShell if needed.
+2. Install any package managers you want WinCarry to use.
+3. Open PowerShell in the preserved WinCarry root.
+4. Run restore dry-run:
 
 ```powershell
-.\wincarry.ps1 scan -Root "D:\WinCarry" -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\restore-scripts\restore-latest.ps1 -DryRun
 ```
 
-## Windows PowerShell Verification
-
-Run these from the repository directory on Windows:
+5. Review the restore plan and skipped app sample.
+6. Run restore:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 help
-powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 scan
-powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 setup -Root "$env:TEMP\WinCarry-Test" -DryRun
-powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 setup -Root "$env:TEMP\WinCarry-Test"
-powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 preflight -Root "$env:TEMP\WinCarry-Test" -DryRun
-powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 preflight -Root "$env:TEMP\WinCarry-Test"
-powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 scan -Root "$env:TEMP\WinCarry-Test" -DryRun
-powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 scan -Root "$env:TEMP\WinCarry-Test"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\restore-scripts\restore-latest.ps1
 ```
 
-Expected result:
+7. Choose restore mode, version policy, and config restore mode only after reviewing the plan.
 
-- help displays usage
-- `scan` reports that it is planned for Phase 3 and makes no changes
-- setup dry-run prints planned folders and creates nothing
-- setup creates folder structure, `config/settings.json`, a copied `wincarry.ps1`, and a log after typing `YES`
-- preflight dry-run prints the system snapshot and writes nothing
-- preflight prints OS/user/admin/drive/package-manager/root details
-- preflight writes a report under `reports` and updates the setup log when the root exists
-- scan dry-run prints raw evidence counts and writes nothing
-- scan writes raw detection JSON under `reports` and updates the setup log when the root exists
-- scan treats known-folder presence as supporting evidence only, not proof of an installed app
+## PowerShell Execution Policy Notes
 
-## Linux PowerShell Verification
-
-Run these from the repository directory on Linux with PowerShell 7 installed:
+The examples use:
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 help
-pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 scan
-pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 setup -Root /tmp/WinCarry-Test-Phase1 -DryRun
-pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 setup -Root /tmp/WinCarry-Test-Phase1
-pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 preflight -Root /tmp/WinCarry-Test-Phase1 -DryRun
-pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 preflight -Root /tmp/WinCarry-Test-Phase1
-pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 scan -Root /tmp/WinCarry-Test-Phase1 -DryRun
-pwsh -NoProfile -ExecutionPolicy Bypass -File wincarry.ps1 scan -Root /tmp/WinCarry-Test-Phase1
+-ExecutionPolicy Bypass
 ```
 
-Use Linux-native paths such as `/tmp/...` when invoking `pwsh` from a Linux shell.
+That bypass applies to the current `powershell.exe` process invocation. It does not permanently change the machine execution policy.
+
+If your environment blocks scripts through Group Policy, App Control, antivirus, or corporate endpoint management, follow your organization's policy instead of bypassing it.
+
+## Supported and Unsupported Categories
+
+WinCarry classifies apps conservatively. Restore confidence is a risk classification, not a success rate or guarantee.
+
+Automatic package-manager restore can be planned for:
+
+- `Winget reinstallable`: package metadata was found for `winget`.
+- `Chocolatey reinstallable`: package metadata was found for Chocolatey.
+- `Scoop-managed`: package metadata was found for Scoop.
+
+Automatic restore still requires an installable package ID and the relevant package manager to be available on the restore machine.
+
+Manual review or manual reinstall categories include:
+
+- `Portable / Self-contained`: app folder was found under WinCarry-managed portable/manual locations.
+- `Installer-based / manual reinstall`: uninstall registry metadata exists but no package-manager identity was found.
+- `Service-heavy`: app likely depends on services, data directories, networking, drivers, or local machine state.
+- `Unknown`: evidence is not strong enough for an automatic strategy.
+
+Unsupported or do-not-restore-automatically categories include:
+
+- `Microsoft Store / UWP`: Store/UWP restore is outside automatic restore scope.
+- `Driver / system component`: device/system-level software should not be copied or restored automatically.
+- `Unsupported / risky`: runtime, SDK, security, VPN, driver, or system-like component that should not be automatically restored.
+
+Manual and unsupported lists are generated so you can review everything that WinCarry will not reinstall automatically.
+
+## Security Warnings
+
+- Manifests and reports can contain application names, package IDs, install paths, usernames, machine names, and profile paths.
+- Do not publish real generated reports or manifests without reviewing and redacting them.
+- Config backup can contain secrets. Sensitive files are skipped by default, but you can override that with `INCLUDE`.
+- Backed-up SSH keys, npm tokens, cloud credentials, and `.env` files can grant access to remote systems.
+- Restore can run package-manager install commands. Review the plan before typing `YES`.
+- Junction mode moves folders and creates reparse points. It is advanced and should be used only after a dry-run review.
+
+## Offline-Safe Mode
+
+Use offline-safe mode when you want local backup, scan, manifest, and report generation without package-manager scan/status/install behavior:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 offline -Root "D:\WinCarry" -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 offline -Root "D:\WinCarry"
+```
+
+Offline-safe mode still reads local inventory/config sources. It is offline-safe with respect to package-manager and network-dependent package operations; it is not a no-file-read sandbox mode.
+
+Manifests generated in offline-safe mode block package-manager restore commands when passed to `restore`.
+
+## Advanced Junction Mode
+
+Junction mode is for advanced manual cases only:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 junction -Root "D:\WinCarry" -DryRun
+```
+
+It blocks protected paths, requires explicit confirmation, backs up the source folder, moves the source to the target, creates a directory junction, verifies the result, and attempts rollback on failure.
+
+Do not use junction mode as a general replacement for reinstalling apps.
+
+## Known Limitations
+
+- Alpha software. Review every plan and keep independent backups.
+- WinCarry does not migrate licenses, activations, accounts, certificates, device drivers, Windows services, databases, or app-specific machine state.
+- Store/UWP apps are not automatically restored.
+- Service-heavy apps require manual review.
+- Runtime and SDK dependencies should generally be installed by Windows, apps, or package managers as needed.
+- Package-manager inventory output can vary by version and locale.
+- Scoop detected-version restore currently installs the latest package instead of pinning a historical version.
+- Config restore is conservative and limited to known paths detected by WinCarry.
+- Linux verification does not prove Windows runtime behavior.
+
+## Repository Files
+
+- `wincarry.ps1`: entry point.
+- `lib/`: helper scripts loaded by the entry point.
+- `.github/workflows/windows-smoke.yml`: Windows GitHub Actions smoke tests.
+- `examples/sample-manifest.json`: small redacted sample manifest.
+- `examples/sample-report.md`: small redacted sample report.
+
+## Verification
+
+Local syntax check with PowerShell:
+
+```powershell
+$files = @((Get-Item -LiteralPath .\wincarry.ps1)) + @(Get-ChildItem -LiteralPath .\lib -Filter "*.ps1" | Sort-Object Name)
+foreach ($file in $files) {
+  $errors = @()
+  $null = [System.Management.Automation.PSParser]::Tokenize((Get-Content -Raw -LiteralPath $file.FullName), [ref]$errors)
+  if ($errors.Count -gt 0) {
+    $errors | Format-List
+    throw "Syntax errors in $($file.FullName)"
+  }
+}
+```
+
+GitHub Actions runs Windows smoke tests on push, pull request, and manual dispatch.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
