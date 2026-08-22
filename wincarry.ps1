@@ -3085,6 +3085,11 @@ function Merge-ConfigBackupIntoManifest {
 
     Add-PropertyIfMissing -Object $Manifest -Name "configBackups" -Value @()
     Add-PropertyIfMissing -Object $Manifest -Name "unmatchedConfigPaths" -Value @()
+    foreach ($app in @(Get-MapValue -Map $Manifest -Key "apps")) {
+        Add-PropertyIfMissing -Object $app -Name "configPaths" -Value @()
+        $app.configPaths = @()
+    }
+    $Manifest.unmatchedConfigPaths = @()
 
     $backupSummary = [ordered]@{
         createdAt = [string](Get-MapValue -Map $BackupMetadata -Key "createdAt")

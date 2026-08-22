@@ -303,8 +303,8 @@ jobs:
             schemaVersion = "1.0"
             apps = @(
               [ordered]@{ name = "Git"; configPaths = @() },
-              [ordered]@{ name = "K-Lite Mega Codec Pack"; configPaths = @() },
-              [ordered]@{ name = "Anaconda Powershell Prompt"; configPaths = @() },
+              [ordered]@{ name = "K-Lite Mega Codec Pack"; configPaths = @([ordered]@{ name = "VS Code User Settings"; originalPath = "stale-vscode" }) },
+              [ordered]@{ name = "Anaconda Powershell Prompt"; configPaths = @([ordered]@{ name = "PowerShell WindowsPowerShell all-hosts profile"; originalPath = "stale-powershell" }) },
               [ordered]@{ name = "Microsoft Visual Studio Code (User)"; configPaths = @() },
               [ordered]@{ name = "PowerShell 7"; configPaths = @() }
             )
