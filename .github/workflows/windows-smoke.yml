@@ -303,6 +303,8 @@ jobs:
             schemaVersion = "1.0"
             apps = @(
               [ordered]@{ name = "Git"; configPaths = @() },
+              [ordered]@{ name = "K-Lite Mega Codec Pack"; configPaths = @() },
+              [ordered]@{ name = "Anaconda Powershell Prompt"; configPaths = @() },
               [ordered]@{ name = "Microsoft Visual Studio Code (User)"; configPaths = @() },
               [ordered]@{ name = "PowerShell 7"; configPaths = @() }
             )
@@ -314,10 +316,15 @@ jobs:
           "`nYES`n" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 backup -Root $mergeRoot
           $mergedManifest = Get-Content -Raw -LiteralPath (Join-Path $mergeRoot "manifests\latest.json") | ConvertFrom-Json
           $gitApp = $mergedManifest.apps | Where-Object { $_.name -eq "Git" } | Select-Object -First 1
+          $codecApp = $mergedManifest.apps | Where-Object { $_.name -eq "K-Lite Mega Codec Pack" } | Select-Object -First 1
+          $anacondaPromptApp = $mergedManifest.apps | Where-Object { $_.name -eq "Anaconda Powershell Prompt" } | Select-Object -First 1
           $codeApp = $mergedManifest.apps | Where-Object { $_.name -eq "Microsoft Visual Studio Code (User)" } | Select-Object -First 1
           $psApp = $mergedManifest.apps | Where-Object { $_.name -eq "PowerShell 7" } | Select-Object -First 1
 
           Assert-True (@($mergedManifest.configBackups).Count -eq 1) "Expected config backup summary in latest manifest."
           Assert-True (@($gitApp.configPaths).Count -ge 1) "Expected Git config paths in latest manifest."
+          Assert-True (@($codecApp.configPaths).Count -eq 0) "Codec app should not receive VS Code config paths."
+          Assert-True (@($anacondaPromptApp.configPaths).Count -eq 0) "Anaconda PowerShell prompt should not receive PowerShell profile config paths."
           Assert-True (@($codeApp.configPaths).Count -ge 1) "Expected VS Code config paths in latest manifest."
           Assert-True (@($psApp.configPaths).Count -ge 1) "Expected PowerShell config paths in latest manifest."
+          Assert-True (@($codeApp.configPaths | Where-Object { $_.appName -eq "Visual Studio Code" }).Count -ge 1) "Expected VS Code config path to retain intended app metadata."

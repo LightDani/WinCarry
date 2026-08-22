@@ -2588,17 +2588,17 @@ function Convert-ConfigDefinitionToCandidate {
 function Get-ConfigDefinitions {
     $definitions = @()
 
-    $definitions += New-ConfigDefinition -Type "safe" -Name "VS Code User Settings" -AppName "Visual Studio Code" -AppNamePattern "visual studio code|vs code|code" -PathTemplate "%APPDATA%\Code\User" -BackupSlug "vscode-user"
-    $definitions += New-ConfigDefinition -Type "safe" -Name "VS Code Insiders User Settings" -AppName "Visual Studio Code" -AppNamePattern "visual studio code|vs code|code" -PathTemplate "%APPDATA%\Code - Insiders\User" -BackupSlug "vscode-insiders-user"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "VS Code User Settings" -AppName "Visual Studio Code" -AppNamePattern "visual studio code|vs code|\bcode\b" -PathTemplate "%APPDATA%\Code\User" -BackupSlug "vscode-user"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "VS Code Insiders User Settings" -AppName "Visual Studio Code" -AppNamePattern "visual studio code|vs code|\bcode\b" -PathTemplate "%APPDATA%\Code - Insiders\User" -BackupSlug "vscode-insiders-user"
     $definitions += New-ConfigDefinition -Type "safe" -Name "VSCodium User Settings" -AppName "VSCodium" -AppNamePattern "vscodium" -PathTemplate "%APPDATA%\VSCodium\User" -BackupSlug "vscodium-user"
     $definitions += New-ConfigDefinition -Type "safe" -Name "Git global config" -AppName "Git" -AppNamePattern "\bgit\b" -PathTemplate "%USERPROFILE%\.gitconfig" -BackupSlug "gitconfig"
     $definitions += New-ConfigDefinition -Type "safe" -Name "Git global ignore" -AppName "Git" -AppNamePattern "\bgit\b" -PathTemplate "%USERPROFILE%\.gitignore_global" -BackupSlug "gitignore-global"
     $definitions += New-ConfigDefinition -Type "safe" -Name "Windows Terminal settings" -AppName "Windows Terminal" -AppNamePattern "windows terminal" -PathTemplate "%LOCALAPPDATA%\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json" -BackupSlug "windows-terminal-settings"
     $definitions += New-ConfigDefinition -Type "safe" -Name "Windows Terminal Preview settings" -AppName "Windows Terminal" -AppNamePattern "windows terminal" -PathTemplate "%LOCALAPPDATA%\Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json" -BackupSlug "windows-terminal-preview-settings"
-    $definitions += New-ConfigDefinition -Type "safe" -Name "PowerShell WindowsPowerShell current-user profile" -AppName "PowerShell" -AppNamePattern "powershell" -PathTemplate "%USERPROFILE%\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1" -BackupSlug "powershell-windows-profile"
-    $definitions += New-ConfigDefinition -Type "safe" -Name "PowerShell WindowsPowerShell all-hosts profile" -AppName "PowerShell" -AppNamePattern "powershell" -PathTemplate "%USERPROFILE%\Documents\WindowsPowerShell\profile.ps1" -BackupSlug "powershell-windows-allhosts-profile"
-    $definitions += New-ConfigDefinition -Type "safe" -Name "PowerShell 7 current-user profile" -AppName "PowerShell" -AppNamePattern "powershell" -PathTemplate "%USERPROFILE%\Documents\PowerShell\Microsoft.PowerShell_profile.ps1" -BackupSlug "powershell-7-profile"
-    $definitions += New-ConfigDefinition -Type "safe" -Name "PowerShell 7 all-hosts profile" -AppName "PowerShell" -AppNamePattern "powershell" -PathTemplate "%USERPROFILE%\Documents\PowerShell\profile.ps1" -BackupSlug "powershell-7-allhosts-profile"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "PowerShell WindowsPowerShell current-user profile" -AppName "PowerShell" -AppNamePattern "^(windows powershell|powershell 7|microsoft powershell|powershell)$" -PathTemplate "%USERPROFILE%\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1" -BackupSlug "powershell-windows-profile"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "PowerShell WindowsPowerShell all-hosts profile" -AppName "PowerShell" -AppNamePattern "^(windows powershell|powershell 7|microsoft powershell|powershell)$" -PathTemplate "%USERPROFILE%\Documents\WindowsPowerShell\profile.ps1" -BackupSlug "powershell-windows-allhosts-profile"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "PowerShell 7 current-user profile" -AppName "PowerShell" -AppNamePattern "^(windows powershell|powershell 7|microsoft powershell|powershell)$" -PathTemplate "%USERPROFILE%\Documents\PowerShell\Microsoft.PowerShell_profile.ps1" -BackupSlug "powershell-7-profile"
+    $definitions += New-ConfigDefinition -Type "safe" -Name "PowerShell 7 all-hosts profile" -AppName "PowerShell" -AppNamePattern "^(windows powershell|powershell 7|microsoft powershell|powershell)$" -PathTemplate "%USERPROFILE%\Documents\PowerShell\profile.ps1" -BackupSlug "powershell-7-allhosts-profile"
     $definitions += New-ConfigDefinition -Type "safe" -Name "npm global config folder" -AppName "Node.js" -AppNamePattern "node|npm" -PathTemplate "%APPDATA%\npm\etc" -BackupSlug "npm-etc" -Warnings @("Files named npmrc are treated as sensitive if copied from user profile; review npm tokens before restore.")
     $definitions += New-ConfigDefinition -Type "safe" -Name "pnpm config" -AppName "pnpm" -AppNamePattern "pnpm|node" -PathTemplate "%LOCALAPPDATA%\pnpm\config" -BackupSlug "pnpm-config"
     $definitions += New-ConfigDefinition -Type "safe" -Name "pnpm roaming config" -AppName "pnpm" -AppNamePattern "pnpm|node" -PathTemplate "%APPDATA%\pnpm\config" -BackupSlug "pnpm-roaming-config"
@@ -2852,9 +2852,11 @@ function New-ConfigBackupMetadata {
         [string]$BackupRootPath,
 
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$ConfigRecords,
 
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$DetectOnlyRecords,
 
         [bool]$IncludeSensitive
@@ -2968,6 +2970,46 @@ function Add-PropertyIfMissing {
     }
 }
 
+function Test-ManifestAppMatchesConfigRecord {
+    param(
+        $App,
+        [Parameter(Mandatory = $true)]
+        $Record
+    )
+
+    $name = [string](Get-MapValue -Map $App -Key "name")
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        return $false
+    }
+
+    $appName = [string](Get-MapValue -Map $Record -Key "appName")
+    if (-not [string]::IsNullOrWhiteSpace($appName) -and (Test-StrongNameMatch -Left $appName -Right $name)) {
+        return $true
+    }
+
+    $pattern = [string](Get-MapValue -Map $Record -Key "appNamePattern")
+    if ([string]::IsNullOrWhiteSpace($pattern)) {
+        if ([string]::IsNullOrWhiteSpace($appName)) {
+            return $false
+        }
+        $pattern = [regex]::Escape($appName)
+    }
+
+    $normalizedName = Get-NormalizedName -Name $name
+    try {
+        if ($name.ToLowerInvariant() -match $pattern.ToLowerInvariant()) {
+            return $true
+        }
+        if (-not [string]::IsNullOrWhiteSpace($normalizedName) -and $normalizedName -match $pattern.ToLowerInvariant()) {
+            return $true
+        }
+    } catch {
+        return $false
+    }
+
+    return $false
+}
+
 function Find-ManifestAppForConfigRecord {
     param(
         [Parameter(Mandatory = $true)]
@@ -2977,14 +3019,8 @@ function Find-ManifestAppForConfigRecord {
         $Record
     )
 
-    $pattern = [string](Get-MapValue -Map $Record -Key "appNamePattern")
-    if ([string]::IsNullOrWhiteSpace($pattern)) {
-        $pattern = [regex]::Escape([string](Get-MapValue -Map $Record -Key "appName"))
-    }
-
     foreach ($app in @(Get-MapValue -Map $Manifest -Key "apps")) {
-        $name = [string](Get-MapValue -Map $app -Key "name")
-        if (-not [string]::IsNullOrWhiteSpace($name) -and $name.ToLowerInvariant() -match $pattern.ToLowerInvariant()) {
+        if (Test-ManifestAppMatchesConfigRecord -App $app -Record $Record) {
             return $app
         }
     }
@@ -3001,6 +3037,8 @@ function New-ManifestConfigPathRecord {
     return [ordered]@{
         type = [string](Get-MapValue -Map $Record -Key "type")
         name = [string](Get-MapValue -Map $Record -Key "name")
+        appName = [string](Get-MapValue -Map $Record -Key "appName")
+        appNamePattern = [string](Get-MapValue -Map $Record -Key "appNamePattern")
         originalPath = [string](Get-MapValue -Map $Record -Key "originalPath")
         restorePathTemplate = [string](Get-MapValue -Map $Record -Key "restorePathTemplate")
         isDirectory = [bool](Get-MapValue -Map $Record -Key "isDirectory")
@@ -4364,6 +4402,49 @@ function Find-CurrentDetectedAppForManifestApp {
     }
 }
 
+
+function Get-ConfigDefinitionForManifestConfigPath {
+    param($ConfigPath)
+
+    $name = [string](Get-MapValue -Map $ConfigPath -Key "name")
+    $restorePathTemplate = [string](Get-MapValue -Map $ConfigPath -Key "restorePathTemplate")
+    foreach ($definition in (Get-ConfigDefinitions)) {
+        $definitionName = [string](Get-MapValue -Map $definition -Key "name")
+        $definitionTemplate = [string](Get-MapValue -Map $definition -Key "restorePathTemplate")
+        if (-not [string]::IsNullOrWhiteSpace($name) -and $definitionName -eq $name) {
+            return $definition
+        }
+        if (-not [string]::IsNullOrWhiteSpace($restorePathTemplate) -and $definitionTemplate -eq $restorePathTemplate) {
+            return $definition
+        }
+    }
+
+    return $null
+}
+
+function Get-ConfigRestoreExpectedAppRecord {
+    param($ConfigPath)
+
+    $appName = [string](Get-MapValue -Map $ConfigPath -Key "appName")
+    $appNamePattern = [string](Get-MapValue -Map $ConfigPath -Key "appNamePattern")
+    if (-not [string]::IsNullOrWhiteSpace($appName) -or -not [string]::IsNullOrWhiteSpace($appNamePattern)) {
+        return [ordered]@{
+            appName = $appName
+            appNamePattern = $appNamePattern
+        }
+    }
+
+    $definition = Get-ConfigDefinitionForManifestConfigPath -ConfigPath $ConfigPath
+    if ($null -eq $definition) {
+        return $null
+    }
+
+    return [ordered]@{
+        appName = [string](Get-MapValue -Map $definition -Key "appName")
+        appNamePattern = [string](Get-MapValue -Map $definition -Key "appNamePattern")
+    }
+}
+
 function New-ConfigRestoreCandidate {
     param(
         $App,
@@ -4388,6 +4469,13 @@ function New-ConfigRestoreCandidate {
         $appId = [string](Get-MapValue -Map $App -Key "id")
         $appName = [string](Get-MapValue -Map $App -Key "name")
         $appVerification = Find-CurrentDetectedAppForManifestApp -ManifestApp $App -CurrentApps $CurrentApps -SuccessfulRestoreResults $SuccessfulRestoreResults
+    }
+
+    $expectedAppRecord = Get-ConfigRestoreExpectedAppRecord -ConfigPath $ConfigPath
+    $expectedAppName = [string](Get-MapValue -Map $expectedAppRecord -Key "appName")
+    $expectedAppMatchesLinkedApp = $true
+    if ($linkedToApp -and $null -ne $expectedAppRecord) {
+        $expectedAppMatchesLinkedApp = Test-ManifestAppMatchesConfigRecord -App $App -Record $expectedAppRecord
     }
 
     $name = [string](Get-MapValue -Map $ConfigPath -Key "name")
@@ -4424,6 +4512,14 @@ function New-ConfigRestoreCandidate {
         $status = "skipped"
         $reason = "No linked manifest app is available for app verification."
         $action = "none"
+    } elseif (-not $expectedAppMatchesLinkedApp) {
+        $status = "skipped"
+        if ([string]::IsNullOrWhiteSpace($expectedAppName)) {
+            $reason = ("Config path does not appear intended for linked app: {0}. Regenerate the manifest after updating WinCarry." -f $appName)
+        } else {
+            $reason = ("Config path appears intended for {0}, but is linked to {1}. Regenerate the manifest after updating WinCarry." -f $expectedAppName, $appName)
+        }
+        $action = "none"
     } elseif (-not [bool](Get-MapValue -Map $appVerification -Key "verified")) {
         $status = "skipped"
         $reason = "Target app is not currently detected and was not restored successfully in this run."
@@ -4457,6 +4553,8 @@ function New-ConfigRestoreCandidate {
         appId = $appId
         appName = $appName
         linkedToApp = $linkedToApp
+        expectedAppName = $expectedAppName
+        expectedAppMatchesLinkedApp = $expectedAppMatchesLinkedApp
         name = $name
         type = [string](Get-MapValue -Map $ConfigPath -Key "type")
         originalPath = [string](Get-MapValue -Map $ConfigPath -Key "originalPath")
