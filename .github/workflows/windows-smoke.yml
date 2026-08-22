@@ -1,0 +1,171 @@
+name: Windows Smoke Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: PowerShell smoke and config backup
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: PowerShell syntax check
+        shell: powershell
+        run: |
+          $errors = @()
+          $null = [System.Management.Automation.PSParser]::Tokenize(
+            (Get-Content -Raw .\wincarry.ps1),
+            [ref]$errors
+          )
+
+          if ($errors.Count -gt 0) {
+            $errors | Format-List | Out-String | Write-Host
+            exit 1
+          }
+
+      - name: CLI smoke tests
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $env:RUNNER_TEMP "WinCarry-CI"
+
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 help
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 setup -Root $root -DryRun
+          "YES" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 setup -Root $root
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 preflight -Root $root -DryRun
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 scan -Root $root -DryRun
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 manifest -Root $root -DryRun
+          "YES" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 manifest -Root $root
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 report -Root $root -DryRun
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 backup -Root $root -DryRun
+
+      - name: Config backup fixture tests
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Assert-True {
+            param(
+              [Parameter(Mandatory = $true)]
+              [bool]$Condition,
+
+              [Parameter(Mandatory = $true)]
+              [string]$Message
+            )
+
+            if (-not $Condition) {
+              throw $Message
+            }
+          }
+
+          function New-FixtureProfile {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$BasePath
+            )
+
+            $profileRoot = Join-Path $BasePath "profile"
+            $appData = Join-Path $BasePath "appdata"
+            $localAppData = Join-Path $BasePath "localappdata"
+            $programData = Join-Path $BasePath "programdata"
+
+            New-Item -ItemType Directory -Force -Path (Join-Path $profileRoot ".ssh") | Out-Null
+            New-Item -ItemType Directory -Force -Path (Join-Path $profileRoot "Documents\PowerShell") | Out-Null
+            New-Item -ItemType Directory -Force -Path (Join-Path $appData "Code\User\Cache") | Out-Null
+            New-Item -ItemType Directory -Force -Path (Join-Path $appData "npm\etc") | Out-Null
+            New-Item -ItemType Directory -Force -Path (Join-Path $appData "discord") | Out-Null
+            New-Item -ItemType Directory -Force -Path (Join-Path $localAppData "Microsoft\Edge\User Data") | Out-Null
+            New-Item -ItemType Directory -Force -Path $programData | Out-Null
+
+            Set-Content -LiteralPath (Join-Path $profileRoot ".gitconfig") -Value "[user]`n`tname = CI User" -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $profileRoot ".npmrc") -Value "//registry.npmjs.org/:_authToken=secret" -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $profileRoot ".ssh\config") -Value "Host example`n  HostName example.test" -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $profileRoot ".ssh\id_ed25519") -Value "PRIVATE KEY" -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $profileRoot "Documents\PowerShell\Microsoft.PowerShell_profile.ps1") -Value "Write-Host profile" -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $appData "Code\User\settings.json") -Value '{"editor.tabSize":2}' -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $appData "Code\User\.env") -Value "SECRET=1" -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $appData "Code\User\Cache\cache.tmp") -Value "cache" -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $appData "npm\etc\npmrc") -Value "registry=https://registry.npmjs.org/" -Encoding UTF8
+
+            $env:USERPROFILE = $profileRoot
+            $env:HOME = $profileRoot
+            $env:APPDATA = $appData
+            $env:LOCALAPPDATA = $localAppData
+            $env:PROGRAMDATA = $programData
+          }
+
+          function Read-BackupMetadata {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$RootPath
+            )
+
+            $path = Join-Path $RootPath "backups\latest-config-backup.json"
+            Assert-True (Test-Path -LiteralPath $path) "Expected latest config backup metadata at $path"
+            return (Get-Content -Raw -LiteralPath $path | ConvertFrom-Json)
+          }
+
+          $fixtureBase = Join-Path $env:RUNNER_TEMP "WinCarry-Fixture"
+          New-FixtureProfile -BasePath $fixtureBase
+
+          $dryRoot = Join-Path $env:RUNNER_TEMP "WinCarry-Backup-DryRun"
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 backup -Root $dryRoot -DryRun
+          Assert-True (-not (Test-Path -LiteralPath $dryRoot)) "Dry-run backup should not create the root folder."
+
+          $defaultRoot = Join-Path $env:RUNNER_TEMP "WinCarry-Backup-Default"
+          "`nYES`n" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 backup -Root $defaultRoot
+          $defaultBackup = Read-BackupMetadata -RootPath $defaultRoot
+          $defaultBackupRoot = [string]$defaultBackup.backupRoot
+
+          Assert-True ([int]$defaultBackup.summary.backedUp -ge 5) "Expected safe configs to be backed up by default."
+          Assert-True ([int]$defaultBackup.summary.skippedSensitive -ge 2) "Expected sensitive configs to be skipped by default."
+          Assert-True ([int]$defaultBackup.summary.detectOnly -ge 2) "Expected browser/chat profiles to be detect-only."
+          Assert-True (-not [bool]$defaultBackup.includeSensitive) "Default backup should not include sensitive files."
+
+          Assert-True (-not (Test-Path -LiteralPath (Join-Path $defaultBackupRoot "configs\npmrc\.npmrc"))) "Default backup copied .npmrc."
+          Assert-True (-not (Test-Path -LiteralPath (Join-Path $defaultBackupRoot "configs\ssh-private-key-id_ed25519\id_ed25519"))) "Default backup copied SSH private key."
+          Assert-True (-not (Test-Path -LiteralPath (Join-Path $defaultBackupRoot "configs\vscode-user\.env"))) "Default backup copied nested .env."
+          Assert-True (-not (Test-Path -LiteralPath (Join-Path $defaultBackupRoot "configs\vscode-user\Cache\cache.tmp"))) "Default backup copied cache file."
+          Assert-True (Test-Path -LiteralPath (Join-Path $defaultRoot "reports")) "Expected backup report folder."
+
+          $includeRoot = Join-Path $env:RUNNER_TEMP "WinCarry-Backup-Include"
+          "INCLUDE`nYES`n" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 backup -Root $includeRoot
+          $includeBackup = Read-BackupMetadata -RootPath $includeRoot
+          $includeBackupRoot = [string]$includeBackup.backupRoot
+
+          Assert-True ([bool]$includeBackup.includeSensitive) "INCLUDE backup should mark includeSensitive true."
+          Assert-True ([int]$includeBackup.summary.skippedSensitive -eq 0) "INCLUDE backup should not skip sensitive candidates."
+          Assert-True (Test-Path -LiteralPath (Join-Path $includeBackupRoot "configs\npmrc\.npmrc")) "INCLUDE backup did not copy .npmrc."
+          Assert-True (Test-Path -LiteralPath (Join-Path $includeBackupRoot "configs\ssh-private-key-id_ed25519\id_ed25519")) "INCLUDE backup did not copy SSH private key."
+          Assert-True (Test-Path -LiteralPath (Join-Path $includeBackupRoot "configs\vscode-user\.env")) "INCLUDE backup did not copy nested .env."
+          Assert-True (-not (Test-Path -LiteralPath (Join-Path $includeBackupRoot "configs\vscode-user\Cache\cache.tmp"))) "INCLUDE backup copied cache file."
+
+          $mergeRoot = Join-Path $env:RUNNER_TEMP "WinCarry-Backup-Merge"
+          New-Item -ItemType Directory -Force -Path (Join-Path $mergeRoot "manifests") | Out-Null
+          $syntheticManifest = [ordered]@{
+            schemaVersion = "1.0"
+            apps = @(
+              [ordered]@{ name = "Git"; configPaths = @() },
+              [ordered]@{ name = "Microsoft Visual Studio Code (User)"; configPaths = @() },
+              [ordered]@{ name = "PowerShell 7"; configPaths = @() }
+            )
+            configBackups = @()
+            unmatchedConfigPaths = @()
+          }
+          Set-Content -LiteralPath (Join-Path $mergeRoot "manifests\latest.json") -Value ($syntheticManifest | ConvertTo-Json -Depth 8) -Encoding UTF8
+
+          "`nYES`n" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 backup -Root $mergeRoot
+          $mergedManifest = Get-Content -Raw -LiteralPath (Join-Path $mergeRoot "manifests\latest.json") | ConvertFrom-Json
+          $gitApp = $mergedManifest.apps | Where-Object { $_.name -eq "Git" } | Select-Object -First 1
+          $codeApp = $mergedManifest.apps | Where-Object { $_.name -eq "Microsoft Visual Studio Code (User)" } | Select-Object -First 1
+          $psApp = $mergedManifest.apps | Where-Object { $_.name -eq "PowerShell 7" } | Select-Object -First 1
+
+          Assert-True (@($mergedManifest.configBackups).Count -eq 1) "Expected config backup summary in latest manifest."
+          Assert-True (@($gitApp.configPaths).Count -ge 1) "Expected Git config paths in latest manifest."
+          Assert-True (@($codeApp.configPaths).Count -ge 1) "Expected VS Code config paths in latest manifest."
+          Assert-True (@($psApp.configPaths).Count -ge 1) "Expected PowerShell config paths in latest manifest."
