@@ -66,7 +66,12 @@ jobs:
 
           $restoreRoot = Join-Path $env:RUNNER_TEMP "WinCarry-Restore-Fixture"
           Remove-Item -LiteralPath $restoreRoot -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path (Join-Path $restoreRoot "manifests"),(Join-Path $restoreRoot "reports"),(Join-Path $restoreRoot "logs") | Out-Null
+          $targetProfile = Join-Path $restoreRoot "TargetProfile"
+          $gitConfigBackup = Join-Path $restoreRoot "backups\fixture\configs\gitconfig"
+          New-Item -ItemType Directory -Force -Path (Join-Path $restoreRoot "manifests"),(Join-Path $restoreRoot "reports"),(Join-Path $restoreRoot "logs"),(Join-Path $restoreRoot "apps\manual\Git"),$gitConfigBackup,$targetProfile | Out-Null
+          Set-Content -LiteralPath (Join-Path $gitConfigBackup ".gitconfig") -Value "restored=true" -Encoding UTF8
+          Set-Content -LiteralPath (Join-Path $targetProfile ".gitconfig") -Value "old=true" -Encoding UTF8
+          $env:USERPROFILE = $targetProfile
 
           $manifest = [ordered]@{
             schemaVersion = "1.0"
@@ -80,7 +85,16 @@ jobs:
                 restoreConfidence = "Medium"
                 restoreStrategy = "reinstall-via-package-manager"
                 packages = @([ordered]@{ manager = "winget"; id = "Git.Git"; version = "2.42.0"; source = "winget" })
-                configPaths = @([ordered]@{ name = "Git config" })
+                configPaths = @([ordered]@{
+                  type = "safe"
+                  name = "Git global config"
+                  originalPath = "C:\Users\Old\.gitconfig"
+                  restorePathTemplate = "%USERPROFILE%\.gitconfig"
+                  isDirectory = $false
+                  backupPath = $gitConfigBackup
+                  backupStatus = "backed_up"
+                  warnings = @()
+                })
               },
               [ordered]@{
                 id = "app-fail"
@@ -121,7 +135,7 @@ jobs:
             )
             manualReinstall = @([ordered]@{ name = "Manual App"; classification = "Unknown"; restoreConfidence = "Unknown"; restoreStrategy = "manual-review"; package = "manual" })
             unsupported = @()
-            unmatchedConfigPaths = @([ordered]@{ name = "unmatched" })
+            unmatchedConfigPaths = @()
           }
           Set-Content -LiteralPath (Join-Path $restoreRoot "manifests\latest.json") -Value ($manifest | ConvertTo-Json -Depth 12) -Encoding UTF8
 
@@ -129,6 +143,8 @@ jobs:
           $dryRunOutput | Write-Host
           $dryRunText = $dryRunOutput -join "`n"
           Assert-True ($dryRunText -match "Package-manager candidates: 3") "Dry-run restore should find three package-manager candidates."
+          Assert-True ($dryRunText -match "Config Restore Plan") "Dry-run restore should show the config restore plan."
+          Assert-True ($dryRunText -match "Existing config conflicts: 1") "Dry-run restore should detect existing config conflicts."
           Assert-True (-not (Get-ChildItem -LiteralPath (Join-Path $restoreRoot "reports") -Filter "restore-*.md" -ErrorAction SilentlyContinue)) "Dry-run restore should not write restore reports."
 
           $fakeBin = Join-Path $env:RUNNER_TEMP "WinCarry-FakeBin"
@@ -156,7 +172,7 @@ jobs:
           $wingetCommand = Get-Command winget -ErrorAction Stop
           Assert-True ([string]$wingetCommand.Source -eq [string]$fakeWinget) "Expected restore fixture to use fake winget at $fakeWinget, got $($wingetCommand.Source)."
 
-          "3`n2`n1,2`nYES`n" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root $restoreRoot
+          "3`n2`n1,2`nYES`n3`nYES`n" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root $restoreRoot
 
           Assert-True (Test-Path -LiteralPath $invocationPath) "Expected fake winget invocation log."
           $invocations = Get-Content -Raw -LiteralPath $invocationPath
@@ -168,9 +184,16 @@ jobs:
           $restoreReport = Get-ChildItem -LiteralPath (Join-Path $restoreRoot "reports") -Filter "restore-*.md" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           Assert-True ($null -ne $restoreReport) "Expected restore report after non-dry restore."
           $reportText = Get-Content -Raw -LiteralPath $restoreReport.FullName
+          $restoredGitConfig = Get-Content -Raw -LiteralPath (Join-Path $targetProfile ".gitconfig")
+          Assert-True ($restoredGitConfig -match "restored=true") "Expected Git config to be restored from backup."
+          $existingBackup = Get-ChildItem -LiteralPath (Join-Path $restoreRoot "backups") -Recurse -Force -File -Filter ".gitconfig" | Where-Object { $_.FullName -match "existing-before-restore" } | Select-Object -First 1
+          Assert-True ($null -ne $existingBackup) "Expected existing Git config to be backed up before replacement."
+          $existingBackupText = Get-Content -Raw -LiteralPath $existingBackup.FullName
+          Assert-True ($existingBackupText -match "old=true") "Existing config backup should preserve old content."
           Assert-True ($reportText -match "Successful commands: 1") "Restore report should record one successful command."
           Assert-True ($reportText -match "Failed commands: 1") "Restore report should record one failed command."
-          Assert-True ($reportText -match "Config restore is deferred to Phase 8") "Restore report should defer config restore."
+          Assert-True ($reportText -match "Restored configs: 1") "Restore report should record one restored config."
+          Assert-True ($reportText -match "Git global config") "Restore report should include the restored config name."
           Assert-True ($reportText -match "Pseudo package") "Restore report should include skipped pseudo package."
 
       - name: Config backup fixture tests

@@ -12,7 +12,7 @@ Current implemented scope:
 - App detection scan with raw evidence, deduplication, and classification
 - Manifest and report generation
 - Config detection and safe backup
-- Restore dry-run and package-manager reinstall flow
+- Restore dry-run, package-manager reinstall flow, and guarded config restore
 #>
 
 [CmdletBinding()]
@@ -2832,6 +2832,7 @@ function New-ConfigBackupRecord {
         appNamePattern = [string](Get-MapValue -Map $Candidate -Key "appNamePattern")
         originalPath = [string](Get-MapValue -Map $Candidate -Key "originalPath")
         restorePathTemplate = [string](Get-MapValue -Map $Candidate -Key "restorePathTemplate")
+        isDirectory = [bool](Get-MapValue -Map $Candidate -Key "isDirectory")
         backupPath = $BackupPath
         backupStatus = $Status
         copiedFiles = $CopiedFiles
@@ -3002,6 +3003,7 @@ function New-ManifestConfigPathRecord {
         name = [string](Get-MapValue -Map $Record -Key "name")
         originalPath = [string](Get-MapValue -Map $Record -Key "originalPath")
         restorePathTemplate = [string](Get-MapValue -Map $Record -Key "restorePathTemplate")
+        isDirectory = [bool](Get-MapValue -Map $Record -Key "isDirectory")
         backupPath = [string](Get-MapValue -Map $Record -Key "backupPath")
         backupStatus = [string](Get-MapValue -Map $Record -Key "backupStatus")
         warnings = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Record -Key "warnings"))
@@ -4160,6 +4162,579 @@ function Get-ManifestConfigPathCount {
     return $count
 }
 
+
+function Test-MapHasKey {
+    param(
+        $Map,
+        [Parameter(Mandatory = $true)]
+        [string]$Key
+    )
+
+    if ($null -eq $Map) {
+        return $false
+    }
+
+    if ($Map -is [System.Collections.IDictionary]) {
+        return $Map.Contains($Key)
+    }
+
+    return ($null -ne $Map.PSObject.Properties[$Key])
+}
+
+function Set-MapValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Map,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Key,
+
+        $Value
+    )
+
+    if ($Map -is [System.Collections.IDictionary]) {
+        $Map[$Key] = $Value
+        return
+    }
+
+    if ($null -ne $Map.PSObject.Properties[$Key]) {
+        $Map.$Key = $Value
+    } else {
+        $Map | Add-Member -NotePropertyName $Key -NotePropertyValue $Value
+    }
+}
+
+function Get-ConfigRestoreExistingBackupRootPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Timestamp
+    )
+
+    return (Join-Path (Join-Path (Join-Path $RootPath "backups") $Timestamp) "existing-before-restore")
+}
+
+function Get-ConfigRestoreSourceInfo {
+    param($ConfigPath)
+
+    $backupPath = [string](Get-MapValue -Map $ConfigPath -Key "backupPath")
+    $originalPath = [string](Get-MapValue -Map $ConfigPath -Key "originalPath")
+    $sourcePath = ""
+    $sourceExists = $false
+    $sourceIsDirectory = $false
+
+    if ([string]::IsNullOrWhiteSpace($backupPath)) {
+        return [ordered]@{
+            sourcePath = ""
+            sourceExists = $false
+            sourceIsDirectory = $false
+        }
+    }
+
+    $resolvedBackupPath = Resolve-DisplayPath -Path $backupPath
+    $hasDirectoryFlag = Test-MapHasKey -Map $ConfigPath -Key "isDirectory"
+    $originalIsDirectory = $false
+    if ($hasDirectoryFlag) {
+        $originalIsDirectory = [bool](Get-MapValue -Map $ConfigPath -Key "isDirectory")
+    }
+
+    if ($hasDirectoryFlag -and $originalIsDirectory) {
+        $sourcePath = $resolvedBackupPath
+        $sourceExists = (Test-Path -LiteralPath $sourcePath -PathType Container)
+        $sourceIsDirectory = $true
+    } else {
+        $leaf = Split-Path -Leaf $originalPath
+        $fileCandidate = ""
+        if (-not [string]::IsNullOrWhiteSpace($leaf)) {
+            $fileCandidate = Join-Path $resolvedBackupPath $leaf
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($fileCandidate) -and (Test-Path -LiteralPath $fileCandidate -PathType Leaf)) {
+            $sourcePath = Resolve-DisplayPath -Path $fileCandidate
+            $sourceExists = $true
+            $sourceIsDirectory = $false
+        } elseif ($hasDirectoryFlag -and -not $originalIsDirectory) {
+            $sourcePath = $fileCandidate
+            $sourceExists = $false
+            $sourceIsDirectory = $false
+        } elseif (Test-Path -LiteralPath $resolvedBackupPath -PathType Container) {
+            $sourcePath = $resolvedBackupPath
+            $sourceExists = $true
+            $sourceIsDirectory = $true
+        } elseif (Test-Path -LiteralPath $resolvedBackupPath -PathType Leaf) {
+            $sourcePath = $resolvedBackupPath
+            $sourceExists = $true
+            $sourceIsDirectory = $false
+        }
+    }
+
+    return [ordered]@{
+        sourcePath = $sourcePath
+        sourceExists = $sourceExists
+        sourceIsDirectory = $sourceIsDirectory
+    }
+}
+
+function Test-RestoreResultSucceededForApp {
+    param(
+        $App,
+        [object[]]$SuccessfulRestoreResults
+    )
+
+    $appId = [string](Get-MapValue -Map $App -Key "id")
+    $appName = [string](Get-MapValue -Map $App -Key "name")
+
+    foreach ($result in @(ConvertTo-ArrayValue -Value $SuccessfulRestoreResults)) {
+        if ([string](Get-MapValue -Map $result -Key "status") -ne "success") {
+            continue
+        }
+
+        $resultAppId = [string](Get-MapValue -Map $result -Key "appId")
+        $resultName = [string](Get-MapValue -Map $result -Key "name")
+        if (-not [string]::IsNullOrWhiteSpace($appId) -and $resultAppId -eq $appId) {
+            return $true
+        }
+        if (Test-StrongNameMatch -Left $appName -Right $resultName) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Find-CurrentDetectedAppForManifestApp {
+    param(
+        $ManifestApp,
+        [object[]]$CurrentApps,
+        [object[]]$SuccessfulRestoreResults = @()
+    )
+
+    $manifestAppName = [string](Get-MapValue -Map $ManifestApp -Key "name")
+    if (Test-RestoreResultSucceededForApp -App $ManifestApp -SuccessfulRestoreResults $SuccessfulRestoreResults) {
+        return [ordered]@{
+            verified = $true
+            method = "restored-in-this-run"
+            matchedName = $manifestAppName
+        }
+    }
+
+    $manifestPackages = @(Get-AppPackages -App $ManifestApp)
+    foreach ($manifestPackage in $manifestPackages) {
+        $manifestManager = [string](Get-MapValue -Map $manifestPackage -Key "manager")
+        $manifestPackageId = Get-NormalizedPackageId -PackageId ([string](Get-MapValue -Map $manifestPackage -Key "id"))
+        if ([string]::IsNullOrWhiteSpace($manifestPackageId)) {
+            continue
+        }
+
+        foreach ($currentApp in @(ConvertTo-ArrayValue -Value $CurrentApps)) {
+            foreach ($currentPackage in @(Get-AppPackages -App $currentApp)) {
+                $currentManager = [string](Get-MapValue -Map $currentPackage -Key "manager")
+                $currentPackageId = Get-NormalizedPackageId -PackageId ([string](Get-MapValue -Map $currentPackage -Key "id"))
+                if ([string]::IsNullOrWhiteSpace($currentPackageId)) {
+                    continue
+                }
+                if ($manifestPackageId -eq $currentPackageId -and ([string]::IsNullOrWhiteSpace($manifestManager) -or [string]::IsNullOrWhiteSpace($currentManager) -or $manifestManager -eq $currentManager)) {
+                    return [ordered]@{
+                        verified = $true
+                        method = "package-match"
+                        matchedName = [string](Get-MapValue -Map $currentApp -Key "name")
+                    }
+                }
+            }
+        }
+    }
+
+    foreach ($currentApp in @(ConvertTo-ArrayValue -Value $CurrentApps)) {
+        $currentName = [string](Get-MapValue -Map $currentApp -Key "name")
+        if (Test-StrongNameMatch -Left $manifestAppName -Right $currentName) {
+            return [ordered]@{
+                verified = $true
+                method = "name-match"
+                matchedName = $currentName
+            }
+        }
+    }
+
+    return [ordered]@{
+        verified = $false
+        method = "not-detected"
+        matchedName = ""
+    }
+}
+
+function New-ConfigRestoreCandidate {
+    param(
+        $App,
+        [Parameter(Mandatory = $true)]
+        $ConfigPath,
+        [Parameter(Mandatory = $true)]
+        [string]$ConflictPolicy,
+        [object[]]$CurrentApps = @(),
+        [object[]]$SuccessfulRestoreResults = @()
+    )
+
+    $linkedToApp = ($null -ne $App)
+    $appId = ""
+    $appName = "Unmatched config path"
+    $appVerification = [ordered]@{
+        verified = $false
+        method = "no-linked-app"
+        matchedName = ""
+    }
+
+    if ($linkedToApp) {
+        $appId = [string](Get-MapValue -Map $App -Key "id")
+        $appName = [string](Get-MapValue -Map $App -Key "name")
+        $appVerification = Find-CurrentDetectedAppForManifestApp -ManifestApp $App -CurrentApps $CurrentApps -SuccessfulRestoreResults $SuccessfulRestoreResults
+    }
+
+    $name = [string](Get-MapValue -Map $ConfigPath -Key "name")
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $name = "Config path"
+    }
+
+    $restorePathTemplate = [string](Get-MapValue -Map $ConfigPath -Key "restorePathTemplate")
+    $targetPath = Resolve-ConfigPathTemplate -Template $restorePathTemplate
+    $sourceInfo = Get-ConfigRestoreSourceInfo -ConfigPath $ConfigPath
+    $sourcePath = [string](Get-MapValue -Map $sourceInfo -Key "sourcePath")
+    $sourceExists = [bool](Get-MapValue -Map $sourceInfo -Key "sourceExists")
+    $sourceIsDirectory = [bool](Get-MapValue -Map $sourceInfo -Key "sourceIsDirectory")
+    $backupStatus = [string](Get-MapValue -Map $ConfigPath -Key "backupStatus")
+    $targetExists = $false
+    if (-not [string]::IsNullOrWhiteSpace($targetPath)) {
+        $targetExists = Test-Path -LiteralPath $targetPath
+    }
+
+    $insideProtectedPath = $false
+    if (-not [string]::IsNullOrWhiteSpace($targetPath)) {
+        $insideProtectedPath = Test-PathInsideProtectedPath -Path $targetPath -ProtectedPaths (Get-ProtectedPaths)
+    }
+
+    $status = "planned"
+    $reason = "Ready to restore."
+    $action = "restore"
+
+    if ($ConflictPolicy -eq "skip") {
+        $status = "skipped"
+        $reason = "Config restore was not selected."
+        $action = "none"
+    } elseif (-not $linkedToApp) {
+        $status = "skipped"
+        $reason = "No linked manifest app is available for app verification."
+        $action = "none"
+    } elseif (-not [bool](Get-MapValue -Map $appVerification -Key "verified")) {
+        $status = "skipped"
+        $reason = "Target app is not currently detected and was not restored successfully in this run."
+        $action = "none"
+    } elseif ($backupStatus -ne "backed_up") {
+        $status = "skipped"
+        $reason = ("Config backup status is not restorable: {0}." -f $backupStatus)
+        $action = "none"
+    } elseif ([string]::IsNullOrWhiteSpace($restorePathTemplate) -or [string]::IsNullOrWhiteSpace($targetPath)) {
+        $status = "skipped"
+        $reason = "Restore path template is missing or could not be resolved."
+        $action = "none"
+    } elseif ($insideProtectedPath) {
+        $status = "skipped"
+        $reason = "Resolved restore target is inside a protected Windows path."
+        $action = "none"
+    } elseif (-not $sourceExists) {
+        $status = "skipped"
+        $reason = "Backed-up config source was not found."
+        $action = "none"
+    } elseif ($targetExists -and $ConflictPolicy -eq "missing-only") {
+        $status = "skipped"
+        $reason = "Target config already exists; conflict policy is skip existing."
+        $action = "none"
+    } elseif ($targetExists -and $ConflictPolicy -eq "replace-existing") {
+        $action = "backup-and-replace"
+        $reason = "Existing config will be backed up before replacement."
+    }
+
+    return [ordered]@{
+        appId = $appId
+        appName = $appName
+        linkedToApp = $linkedToApp
+        name = $name
+        type = [string](Get-MapValue -Map $ConfigPath -Key "type")
+        originalPath = [string](Get-MapValue -Map $ConfigPath -Key "originalPath")
+        restorePathTemplate = $restorePathTemplate
+        sourceBackupPath = $sourcePath
+        sourceExists = $sourceExists
+        sourceIsDirectory = $sourceIsDirectory
+        targetPath = $targetPath
+        targetExists = $targetExists
+        insideProtectedPath = $insideProtectedPath
+        backupStatus = $backupStatus
+        appVerified = [bool](Get-MapValue -Map $appVerification -Key "verified")
+        appVerification = $appVerification
+        conflictPolicy = $ConflictPolicy
+        action = $action
+        status = $status
+        reason = $reason
+        existingBackupPath = ""
+        copiedFiles = 0
+        error = ""
+        warnings = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $ConfigPath -Key "warnings"))
+    }
+}
+
+function Get-ConfigRestoreSummary {
+    param(
+        [object[]]$Candidates,
+        [Parameter(Mandatory = $true)]
+        [string]$ConflictPolicy,
+        [Parameter(Mandatory = $true)]
+        [string]$ExistingBackupRootPath
+    )
+
+    $candidateList = @(ConvertTo-ArrayValue -Value $Candidates)
+    return [ordered]@{
+        availableConfigPathCount = $candidateList.Count
+        linkedConfigPathCount = @($candidateList | Where-Object { [bool](Get-MapValue -Map $_ -Key "linkedToApp") }).Count
+        unmatchedConfigPathCount = @($candidateList | Where-Object { -not [bool](Get-MapValue -Map $_ -Key "linkedToApp") }).Count
+        appVerifiedCount = @($candidateList | Where-Object { [bool](Get-MapValue -Map $_ -Key "appVerified") }).Count
+        existingTargetCount = @($candidateList | Where-Object { [bool](Get-MapValue -Map $_ -Key "targetExists") }).Count
+        plannedRestoreCount = @($candidateList | Where-Object { [string](Get-MapValue -Map $_ -Key "status") -eq "planned" }).Count
+        restoredCount = @($candidateList | Where-Object { [string](Get-MapValue -Map $_ -Key "status") -eq "restored" }).Count
+        skippedCount = @($candidateList | Where-Object { [string](Get-MapValue -Map $_ -Key "status") -eq "skipped" }).Count
+        failedCount = @($candidateList | Where-Object { [string](Get-MapValue -Map $_ -Key "status") -eq "failed" }).Count
+        conflictPolicy = $ConflictPolicy
+        existingBackupRootPath = $ExistingBackupRootPath
+    }
+}
+
+function Update-ConfigRestoreSummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        $ConfigRestore
+    )
+
+    $summary = Get-ConfigRestoreSummary -Candidates (Get-MapValue -Map $ConfigRestore -Key "candidates") -ConflictPolicy ([string](Get-MapValue -Map $ConfigRestore -Key "conflictPolicy")) -ExistingBackupRootPath ([string](Get-MapValue -Map $ConfigRestore -Key "existingBackupRootPath"))
+    Set-MapValue -Map $ConfigRestore -Key "summary" -Value $summary
+}
+
+function New-ConfigRestorePlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Manifest,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ConflictPolicy,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExistingBackupRootPath,
+
+        [object[]]$CurrentApps = @(),
+        [object[]]$SuccessfulRestoreResults = @()
+    )
+
+    $candidates = @()
+    foreach ($app in @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "apps"))) {
+        foreach ($configPath in @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $app -Key "configPaths"))) {
+            $candidates += New-ConfigRestoreCandidate -App $app -ConfigPath $configPath -ConflictPolicy $ConflictPolicy -CurrentApps $CurrentApps -SuccessfulRestoreResults $SuccessfulRestoreResults
+        }
+    }
+
+    foreach ($configPath in @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "unmatchedConfigPaths"))) {
+        $candidates += New-ConfigRestoreCandidate -App $null -ConfigPath $configPath -ConflictPolicy $ConflictPolicy -CurrentApps $CurrentApps -SuccessfulRestoreResults $SuccessfulRestoreResults
+    }
+
+    $summary = Get-ConfigRestoreSummary -Candidates $candidates -ConflictPolicy $ConflictPolicy -ExistingBackupRootPath $ExistingBackupRootPath
+    return [ordered]@{
+        phase = "Phase 8"
+        attempted = $false
+        executed = $false
+        conflictPolicy = $ConflictPolicy
+        existingBackupRootPath = $ExistingBackupRootPath
+        candidates = @($candidates)
+        summary = $summary
+    }
+}
+
+function Show-ConfigRestorePlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        $ConfigRestore
+    )
+
+    $summary = Get-MapValue -Map $ConfigRestore -Key "summary"
+    $candidates = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $ConfigRestore -Key "candidates"))
+
+    Write-Host ""
+    Write-Host "Config Restore Plan"
+    Write-Host ""
+    Write-Host ("Conflict policy: {0}" -f (Get-MapValue -Map $summary -Key "conflictPolicy"))
+    Write-Host ("Existing-config backup root: {0}" -f (Get-MapValue -Map $summary -Key "existingBackupRootPath"))
+    Write-Host ("Available config paths: {0}" -f (Get-MapValue -Map $summary -Key "availableConfigPathCount"))
+    Write-Host ("Linked to app: {0}" -f (Get-MapValue -Map $summary -Key "linkedConfigPathCount"))
+    Write-Host ("App verified: {0}" -f (Get-MapValue -Map $summary -Key "appVerifiedCount"))
+    Write-Host ("Existing target conflicts: {0}" -f (Get-MapValue -Map $summary -Key "existingTargetCount"))
+    Write-Host ("Planned config restores: {0}" -f (Get-MapValue -Map $summary -Key "plannedRestoreCount"))
+    Write-Host ("Skipped config paths: {0}" -f (Get-MapValue -Map $summary -Key "skippedCount"))
+
+    Write-Host ""
+    Write-Host "Config Restore Sample"
+    if ($candidates.Count -eq 0) {
+        Write-Host "- None"
+        return
+    }
+
+    foreach ($candidate in @($candidates | Select-Object -First 10)) {
+        $statusText = [string](Get-MapValue -Map $candidate -Key "status")
+        $reason = [string](Get-MapValue -Map $candidate -Key "reason")
+        Write-Host ("- {0} / {1}: {2}" -f (Get-MapValue -Map $candidate -Key "appName"), (Get-MapValue -Map $candidate -Key "name"), $statusText)
+        Write-Host ("  Target: {0}" -f (Get-MapValue -Map $candidate -Key "targetPath"))
+        if (-not [string]::IsNullOrWhiteSpace($reason)) {
+            Write-Host ("  Reason: {0}" -f $reason)
+        }
+    }
+    if ($candidates.Count -gt 10) {
+        Write-Host ("- ... {0} more config path(s) in the restore report" -f ($candidates.Count - 10))
+    }
+}
+
+function Read-ConfigRestorePolicy {
+    param($ConfigRestore)
+
+    $summary = Get-MapValue -Map $ConfigRestore -Key "summary"
+    Write-Host ""
+    Write-Host "Config Restore"
+    Write-Host ""
+    Write-Host ("Available config paths: {0}" -f (Get-MapValue -Map $summary -Key "availableConfigPathCount"))
+    Write-Host ("Existing target conflicts: {0}" -f (Get-MapValue -Map $summary -Key "existingTargetCount"))
+    Write-Host "[1] Skip config restore (default)"
+    Write-Host "[2] Restore missing configs only"
+    Write-Host "[3] Back up existing configs, then replace"
+    Write-Host ""
+
+    $choice = Read-Host "Choose config restore mode [1]"
+    switch ($choice) {
+        "2" { return "missing-only" }
+        "3" { return "replace-existing" }
+        default { return "skip" }
+    }
+}
+
+function Backup-ExistingConfigTarget {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Candidate,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExistingBackupRootPath,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Index
+    )
+
+    $targetPath = [string](Get-MapValue -Map $Candidate -Key "targetPath")
+    if ([string]::IsNullOrWhiteSpace($targetPath) -or -not (Test-Path -LiteralPath $targetPath)) {
+        return ""
+    }
+
+    if (-not (Test-Path -LiteralPath $ExistingBackupRootPath)) {
+        New-Item -ItemType Directory -Path $ExistingBackupRootPath -Force | Out-Null
+    }
+
+    $safeName = Get-SafeFileName -Name ("{0}-{1}" -f (Get-MapValue -Map $Candidate -Key "appName"), (Get-MapValue -Map $Candidate -Key "name"))
+    $backupDestination = Join-Path $ExistingBackupRootPath ("{0:000}-{1}" -f $Index, $safeName)
+    if (-not (Test-Path -LiteralPath $backupDestination)) {
+        New-Item -ItemType Directory -Path $backupDestination -Force | Out-Null
+    }
+
+    Copy-Item -LiteralPath $targetPath -Destination $backupDestination -Recurse -Force
+    return (Resolve-DisplayPath -Path $backupDestination)
+}
+
+function Copy-ConfigRestoreSource {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourcePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TargetPath,
+
+        [bool]$SourceIsDirectory
+    )
+
+    if ($SourceIsDirectory) {
+        if (-not (Test-Path -LiteralPath $TargetPath)) {
+            New-Item -ItemType Directory -Path $TargetPath -Force | Out-Null
+        }
+
+        foreach ($child in @(Get-ChildItem -LiteralPath $SourcePath -Force -ErrorAction SilentlyContinue)) {
+            Copy-Item -LiteralPath $child.FullName -Destination $TargetPath -Recurse -Force
+        }
+
+        return @((Get-ChildItem -LiteralPath $SourcePath -Force -File -Recurse -ErrorAction SilentlyContinue)).Count
+    }
+
+    $targetParent = Split-Path -Parent $TargetPath
+    if (-not [string]::IsNullOrWhiteSpace($targetParent) -and -not (Test-Path -LiteralPath $targetParent)) {
+        New-Item -ItemType Directory -Path $targetParent -Force | Out-Null
+    }
+
+    Copy-Item -LiteralPath $SourcePath -Destination $TargetPath -Force
+    return 1
+}
+
+function Invoke-ConfigRestorePlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        $ConfigRestore
+    )
+
+    $candidates = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $ConfigRestore -Key "candidates"))
+    $backupRoot = [string](Get-MapValue -Map $ConfigRestore -Key "existingBackupRootPath")
+    $policy = [string](Get-MapValue -Map $ConfigRestore -Key "conflictPolicy")
+    $index = 0
+
+    Set-MapValue -Map $ConfigRestore -Key "attempted" -Value $true
+    Set-MapValue -Map $ConfigRestore -Key "executed" -Value $true
+
+    foreach ($candidate in $candidates) {
+        if ([string](Get-MapValue -Map $candidate -Key "status") -ne "planned") {
+            continue
+        }
+
+        $index++
+        $targetPath = [string](Get-MapValue -Map $candidate -Key "targetPath")
+        $sourcePath = [string](Get-MapValue -Map $candidate -Key "sourceBackupPath")
+        $sourceIsDirectory = [bool](Get-MapValue -Map $candidate -Key "sourceIsDirectory")
+
+        try {
+            if (Test-Path -LiteralPath $targetPath) {
+                if ($policy -ne "replace-existing") {
+                    Set-MapValue -Map $candidate -Key "status" -Value "skipped"
+                    Set-MapValue -Map $candidate -Key "reason" -Value "Target config already exists; conflict policy is skip existing."
+                    continue
+                }
+
+                $existingBackupPath = Backup-ExistingConfigTarget -Candidate $candidate -ExistingBackupRootPath $backupRoot -Index $index
+                Set-MapValue -Map $candidate -Key "existingBackupPath" -Value $existingBackupPath
+                Remove-Item -LiteralPath $targetPath -Recurse -Force
+            }
+
+            $copiedFiles = Copy-ConfigRestoreSource -SourcePath $sourcePath -TargetPath $targetPath -SourceIsDirectory:$sourceIsDirectory
+            Set-MapValue -Map $candidate -Key "status" -Value "restored"
+            Set-MapValue -Map $candidate -Key "reason" -Value "Config restored."
+            Set-MapValue -Map $candidate -Key "copiedFiles" -Value $copiedFiles
+            Write-Info ("Config restored: {0} -> {1}" -f (Get-MapValue -Map $candidate -Key "name"), $targetPath)
+        } catch {
+            Set-MapValue -Map $candidate -Key "status" -Value "failed"
+            Set-MapValue -Map $candidate -Key "reason" -Value "Config restore failed."
+            Set-MapValue -Map $candidate -Key "error" -Value $_.Exception.Message
+            Write-WarningText ("Config restore failed for {0}: {1}" -f (Get-MapValue -Map $candidate -Key "name"), $_.Exception.Message)
+        }
+    }
+
+    Update-ConfigRestoreSummary -ConfigRestore $ConfigRestore
+    return $ConfigRestore
+}
+
 function Read-RestoreSelectionMode {
     param($Manifest)
 
@@ -4536,9 +5111,25 @@ function New-RestorePlan {
         manualReview = @($manualApps)
         unsupported = @($unsupportedApps)
         configRestore = [ordered]@{
+            phase = "Phase 8"
             attempted = $false
-            deferredToPhase = "Phase 8"
-            configPathCount = (Get-ManifestConfigPathCount -Manifest $Manifest)
+            executed = $false
+            conflictPolicy = "skip"
+            existingBackupRootPath = ""
+            candidates = @()
+            summary = [ordered]@{
+                availableConfigPathCount = (Get-ManifestConfigPathCount -Manifest $Manifest)
+                linkedConfigPathCount = 0
+                unmatchedConfigPathCount = 0
+                appVerifiedCount = 0
+                existingTargetCount = 0
+                plannedRestoreCount = 0
+                restoredCount = 0
+                skippedCount = 0
+                failedCount = 0
+                conflictPolicy = "skip"
+                existingBackupRootPath = ""
+            }
         }
         summary = [ordered]@{
             manifestAppCount = $apps.Count
@@ -4582,7 +5173,11 @@ function Show-RestorePlan {
     Write-Host ("- Skipped apps: {0}" -f (Get-MapValue -Map $summary -Key "skippedCount"))
     Write-Host ("- Manual reinstall / review: {0}" -f (Get-MapValue -Map $summary -Key "manualReviewCount"))
     Write-Host ("- Unsupported / do not restore automatically: {0}" -f (Get-MapValue -Map $summary -Key "unsupportedCount"))
-    Write-Host ("- Config paths deferred to Phase 8: {0}" -f (Get-MapValue -Map $summary -Key "configPathCount"))
+    $configRestore = Get-MapValue -Map $Plan -Key "configRestore"
+    $configSummary = Get-MapValue -Map $configRestore -Key "summary"
+    Write-Host ("- Config paths available: {0}" -f (Get-MapValue -Map $summary -Key "configPathCount"))
+    Write-Host ("- Planned config restores: {0}" -f (Get-MapValue -Map $configSummary -Key "plannedRestoreCount"))
+    Write-Host ("- Existing config conflicts: {0}" -f (Get-MapValue -Map $configSummary -Key "existingTargetCount"))
 
     Write-Host ""
     Write-Host "Current Package Managers"
@@ -4623,8 +5218,7 @@ function Show-RestorePlan {
         }
     }
 
-    Write-Host ""
-    Write-Info "Config restore is not attempted in Phase 7. It is deferred to Phase 8."
+    Show-ConfigRestorePlan -ConfigRestore (Get-MapValue -Map $Plan -Key "configRestore")
 }
 
 function Invoke-RestoreCommandPlan {
@@ -4705,7 +5299,7 @@ function Convert-RestoreReportToMarkdown {
     $lines.Add(("Selection mode: {0}" -f (Get-MapValue -Map $Plan -Key "selectionMode")))
     $lines.Add(("Version policy: {0}" -f (Get-MapValue -Map $Plan -Key "versionPolicy")))
     $lines.Add("")
-    $lines.Add("> Phase 7 only reinstalls selected apps through package managers. Config restore is deferred to Phase 8.")
+    $lines.Add("> Restore reinstalls selected apps through package managers, then can restore backed-up configs after app verification.")
     $lines.Add("")
 
     $warnings = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Plan -Key "warnings"))
@@ -4738,7 +5332,12 @@ function Convert-RestoreReportToMarkdown {
     $lines.Add(("- Skipped apps: {0}" -f (Get-MapValue -Map $summary -Key "skippedCount")))
     $lines.Add(("- Manual reinstall / review: {0}" -f (Get-MapValue -Map $summary -Key "manualReviewCount")))
     $lines.Add(("- Unsupported / do not restore automatically: {0}" -f (Get-MapValue -Map $summary -Key "unsupportedCount")))
-    $lines.Add(("- Config paths deferred to Phase 8: {0}" -f (Get-MapValue -Map $summary -Key "configPathCount")))
+    $configRestore = Get-MapValue -Map $Plan -Key "configRestore"
+    $configSummary = Get-MapValue -Map $configRestore -Key "summary"
+    $lines.Add(("- Config paths available: {0}" -f (Get-MapValue -Map $summary -Key "configPathCount")))
+    $lines.Add(("- Planned config restores: {0}" -f (Get-MapValue -Map $configSummary -Key "plannedRestoreCount")))
+    $lines.Add(("- Restored configs: {0}" -f (Get-MapValue -Map $configSummary -Key "restoredCount")))
+    $lines.Add(("- Failed config restores: {0}" -f (Get-MapValue -Map $configSummary -Key "failedCount")))
     $lines.Add("")
 
     $lines.Add("## Package Managers")
@@ -4804,9 +5403,43 @@ function Convert-RestoreReportToMarkdown {
 
     $lines.Add("## Config Restore")
     $lines.Add("")
-    $lines.Add(("- Attempted: {0}" -f (Get-MapValue -Map (Get-MapValue -Map $Plan -Key "configRestore") -Key "attempted")))
-    $lines.Add(("- Deferred to: {0}" -f (Get-MapValue -Map (Get-MapValue -Map $Plan -Key "configRestore") -Key "deferredToPhase")))
-    $lines.Add(("- Config paths available for later restore: {0}" -f (Get-MapValue -Map (Get-MapValue -Map $Plan -Key "configRestore") -Key "configPathCount")))
+    $configRestore = Get-MapValue -Map $Plan -Key "configRestore"
+    $configSummary = Get-MapValue -Map $configRestore -Key "summary"
+    $configCandidates = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $configRestore -Key "candidates"))
+    $lines.Add(("- Attempted: {0}" -f (Get-MapValue -Map $configRestore -Key "attempted")))
+    $lines.Add(("- Executed: {0}" -f (Get-MapValue -Map $configRestore -Key "executed")))
+    $lines.Add(("- Conflict policy: {0}" -f (Get-MapValue -Map $configSummary -Key "conflictPolicy")))
+    $lines.Add(("- Existing-config backup root: {0}" -f (Get-MapValue -Map $configSummary -Key "existingBackupRootPath")))
+    $lines.Add(("- Available config paths: {0}" -f (Get-MapValue -Map $configSummary -Key "availableConfigPathCount")))
+    $lines.Add(("- Linked to app: {0}" -f (Get-MapValue -Map $configSummary -Key "linkedConfigPathCount")))
+    $lines.Add(("- App verified: {0}" -f (Get-MapValue -Map $configSummary -Key "appVerifiedCount")))
+    $lines.Add(("- Existing target conflicts: {0}" -f (Get-MapValue -Map $configSummary -Key "existingTargetCount")))
+    $lines.Add(("- Planned config restores: {0}" -f (Get-MapValue -Map $configSummary -Key "plannedRestoreCount")))
+    $lines.Add(("- Restored configs: {0}" -f (Get-MapValue -Map $configSummary -Key "restoredCount")))
+    $lines.Add(("- Skipped config paths: {0}" -f (Get-MapValue -Map $configSummary -Key "skippedCount")))
+    $lines.Add(("- Failed config restores: {0}" -f (Get-MapValue -Map $configSummary -Key "failedCount")))
+    $lines.Add("")
+
+    if ($configCandidates.Count -eq 0) {
+        $lines.Add("No config paths were available in the manifest.")
+    } else {
+        $lines.Add("| App | Config | Status | Target | Reason | Existing backup |")
+        $lines.Add("| --- | --- | --- | --- | --- | --- |")
+        foreach ($candidate in $configCandidates) {
+            $reason = [string](Get-MapValue -Map $candidate -Key "reason")
+            $errorText = [string](Get-MapValue -Map $candidate -Key "error")
+            if (-not [string]::IsNullOrWhiteSpace($errorText)) {
+                $reason = ("{0} Error: {1}" -f $reason, $errorText).Trim()
+            }
+            $lines.Add(("| {0} | {1} | {2} | {3} | {4} | {5} |" -f
+                (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $candidate -Key "appName")),
+                (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $candidate -Key "name")),
+                (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $candidate -Key "status")),
+                (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $candidate -Key "targetPath")),
+                (ConvertTo-MarkdownCell -Text $reason),
+                (ConvertTo-MarkdownCell -Text (Get-MapValue -Map $candidate -Key "existingBackupPath"))))
+        }
+    }
 
     return ($lines -join [Environment]::NewLine)
 }
@@ -4817,7 +5450,7 @@ function Ensure-RestoreArtifactDirectories {
         [string]$RootPath
     )
 
-    foreach ($folder in @("reports", "logs")) {
+    foreach ($folder in @("reports", "logs", "backups")) {
         $path = Join-Path $RootPath $folder
         if (-not (Test-Path -LiteralPath $path)) {
             New-Item -ItemType Directory -Path $path -Force | Out-Null
@@ -4877,16 +5510,21 @@ function Invoke-Restore {
         $selectedApps = @(Select-RestoreApps -Manifest $manifest -SelectionMode $selectionMode)
     }
 
-    $plan = New-RestorePlan -Manifest $manifest -Preflight $preflight -ManifestPath $latestManifestPath -RootPath $resolvedRoot -SelectionMode $selectionMode -VersionPolicy $versionPolicy -SelectedApps $selectedApps -Warnings $warnings
-    Show-RestorePlan -Plan $plan
-
     $timestamp = Get-FileTimestamp
     $reportPath = Get-RestoreReportPath -RootPath $resolvedRoot -Timestamp $timestamp
     $logPath = Get-LogPath -RootPath $resolvedRoot
+    $existingConfigBackupRoot = Get-ConfigRestoreExistingBackupRootPath -RootPath $resolvedRoot -Timestamp $timestamp
+    $currentScan = New-AppScanSnapshot -RootPath $resolvedRoot
+    $currentApps = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $currentScan -Key "apps"))
+
+    $plan = New-RestorePlan -Manifest $manifest -Preflight $preflight -ManifestPath $latestManifestPath -RootPath $resolvedRoot -SelectionMode $selectionMode -VersionPolicy $versionPolicy -SelectedApps $selectedApps -Warnings $warnings
+    $configPreview = New-ConfigRestorePlan -Manifest $manifest -ConflictPolicy "missing-only" -ExistingBackupRootPath $existingConfigBackupRoot -CurrentApps $currentApps
+    Set-MapValue -Map $plan -Key "configRestore" -Value $configPreview
+    Show-RestorePlan -Plan $plan
 
     if ($DryRunOnly) {
         Write-Host ""
-        Write-Info "Dry-run only. No install commands, report, or log file were written."
+        Write-Info "Dry-run only. No install commands, config files, report, or log file were written."
         Write-Info ("Would write restore report if reports folder exists: {0}" -f $reportPath)
         Write-Info ("Would write log if logs folder exists: {0}" -f $logPath)
         return
@@ -4894,7 +5532,7 @@ function Invoke-Restore {
 
     $commands = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $plan -Key "commands"))
     if ($commands.Count -eq 0) {
-        if (-not (Read-RequiredConfirmation -Prompt "Write restore review report?")) {
+        if (-not (Read-RequiredConfirmation -Prompt "Continue restore and write review report?")) {
             Write-Host ""
             Write-Info "Restore cancelled. No files were changed."
             return
@@ -4909,12 +5547,41 @@ function Invoke-Restore {
         $results = @(Invoke-RestoreCommandPlan -Commands $commands)
     }
 
+    $configPreviewSummary = Get-MapValue -Map (Get-MapValue -Map $plan -Key "configRestore") -Key "summary"
+    if ([int](Get-MapValue -Map $configPreviewSummary -Key "availableConfigPathCount") -eq 0) {
+        Write-Host ""
+        Write-Info "No backed-up config paths are available in the manifest."
+        $configPolicy = "skip"
+    } else {
+        $configPolicy = Read-ConfigRestorePolicy -ConfigRestore (Get-MapValue -Map $plan -Key "configRestore")
+    }
+    $configPlan = New-ConfigRestorePlan -Manifest $manifest -ConflictPolicy $configPolicy -ExistingBackupRootPath $existingConfigBackupRoot -CurrentApps $currentApps -SuccessfulRestoreResults $results
+    Set-MapValue -Map $plan -Key "configRestore" -Value $configPlan
+
+    if ($configPolicy -eq "skip") {
+        Write-Host ""
+        Write-Info "Config restore skipped by user selection."
+    } else {
+        Show-ConfigRestorePlan -ConfigRestore $configPlan
+        $plannedConfigRestores = [int](Get-MapValue -Map (Get-MapValue -Map $configPlan -Key "summary") -Key "plannedRestoreCount")
+        if ($plannedConfigRestores -eq 0) {
+            Write-Host ""
+            Write-Info "No config paths are eligible for restore with the selected policy."
+        } elseif (Read-RequiredConfirmation -Prompt "Restore backed-up config files?") {
+            Invoke-ConfigRestorePlan -ConfigRestore $configPlan | Out-Null
+        } else {
+            Write-Host ""
+            Write-Info "Config restore cancelled. No config files were changed."
+        }
+    }
+
     Ensure-RestoreArtifactDirectories -RootPath $resolvedRoot
     Set-Content -LiteralPath $reportPath -Value (Convert-RestoreReportToMarkdown -Plan $plan -Results $results) -Encoding UTF8
 
     $successCount = @($results | Where-Object { [string](Get-MapValue -Map $_ -Key "status") -eq "success" }).Count
     $failedCount = @($results | Where-Object { [string](Get-MapValue -Map $_ -Key "status") -eq "failed" }).Count
-    $message = "Restore completed for root {0}; selected={1}; planned={2}; success={3}; failed={4}; skipped={5}; report={6}" -f $resolvedRoot, $plan.summary.selectedAppCount, $plan.summary.plannedInstallCount, $successCount, $failedCount, $plan.summary.skippedCount, $reportPath
+    $configSummary = Get-MapValue -Map (Get-MapValue -Map $plan -Key "configRestore") -Key "summary"
+    $message = "Restore completed for root {0}; selected={1}; planned={2}; success={3}; failed={4}; skipped={5}; configsRestored={6}; configFailed={7}; report={8}" -f $resolvedRoot, $plan.summary.selectedAppCount, $plan.summary.plannedInstallCount, $successCount, $failedCount, $plan.summary.skippedCount, (Get-MapValue -Map $configSummary -Key "restoredCount"), (Get-MapValue -Map $configSummary -Key "failedCount"), $reportPath
     Write-WinCarryLog -RootPath $resolvedRoot -Operation "restore" -Result "success" -Message $message
 
     Write-Host ""
@@ -4922,6 +5589,9 @@ function Invoke-Restore {
     Write-Info ("Log updated: {0}" -f $logPath)
     if ($failedCount -gt 0) {
         Write-WarningText ("{0} restore command(s) failed. Review the restore report before continuing." -f $failedCount)
+    }
+    if ([int](Get-MapValue -Map $configSummary -Key "failedCount") -gt 0) {
+        Write-WarningText ("{0} config restore(s) failed. Review the restore report before continuing." -f (Get-MapValue -Map $configSummary -Key "failedCount"))
     }
 }
 
@@ -5043,7 +5713,7 @@ function Show-Help {
     Write-Host "  .\wincarry.ps1 offline"
     Write-Host "  .\wincarry.ps1 junction"
     Write-Host ""
-    Write-Host "Implemented: CLI shell, setup, preflight, app detection/classification, manifests, reports, config backup, and package-manager restore."
+    Write-Host "Implemented: CLI shell, setup, preflight, app detection/classification, manifests, reports, config backup, package-manager restore, and guarded config restore."
     Write-Host "Offline and junction currently show placeholders and make no changes."
 }
 
