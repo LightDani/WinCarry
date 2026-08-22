@@ -42,7 +42,126 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 manifest -Root $root -DryRun
           "YES" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 manifest -Root $root
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 report -Root $root -DryRun
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root $root -DryRun
           powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 backup -Root $root -DryRun
+
+      - name: Restore fixture tests
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Assert-True {
+            param(
+              [Parameter(Mandatory = $true)]
+              [bool]$Condition,
+
+              [Parameter(Mandatory = $true)]
+              [string]$Message
+            )
+
+            if (-not $Condition) {
+              throw $Message
+            }
+          }
+
+          $restoreRoot = Join-Path $env:RUNNER_TEMP "WinCarry-Restore-Fixture"
+          Remove-Item -LiteralPath $restoreRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path (Join-Path $restoreRoot "manifests"),(Join-Path $restoreRoot "reports"),(Join-Path $restoreRoot "logs") | Out-Null
+
+          $manifest = [ordered]@{
+            schemaVersion = "1.0"
+            createdAt = (Get-Date).ToString("o")
+            root = [ordered]@{ winCarryRoot = $restoreRoot }
+            apps = @(
+              [ordered]@{
+                id = "app-git"
+                name = "Git"
+                classification = "Winget reinstallable"
+                restoreConfidence = "Medium"
+                restoreStrategy = "reinstall-via-package-manager"
+                packages = @([ordered]@{ manager = "winget"; id = "Git.Git"; version = "2.42.0"; source = "winget" })
+                configPaths = @([ordered]@{ name = "Git config" })
+              },
+              [ordered]@{
+                id = "app-fail"
+                name = "Fail App"
+                classification = "Winget reinstallable"
+                restoreConfidence = "Medium"
+                restoreStrategy = "reinstall-via-package-manager"
+                packages = @([ordered]@{ manager = "winget"; id = "Fail.App"; version = "1.0"; source = "winget" })
+                configPaths = @()
+              },
+              [ordered]@{
+                id = "app-pseudo"
+                name = "Pseudo package"
+                classification = "Winget reinstallable"
+                restoreConfidence = "Medium"
+                restoreStrategy = "reinstall-via-package-manager"
+                packages = @([ordered]@{ manager = "winget"; id = "MSIX\Pseudo.Package_1"; version = "1.0"; source = "" })
+                configPaths = @()
+              },
+              [ordered]@{
+                id = "app-scoop"
+                name = "Scoop App"
+                classification = "Scoop-managed"
+                restoreConfidence = "High"
+                restoreStrategy = "restore-via-scoop"
+                packages = @([ordered]@{ manager = "scoop"; id = "ripgrep"; version = "13.0"; source = "" })
+                configPaths = @()
+              },
+              [ordered]@{
+                id = "app-manual"
+                name = "Manual App"
+                classification = "Unknown"
+                restoreConfidence = "Unknown"
+                restoreStrategy = "manual-review"
+                packages = @()
+                configPaths = @()
+              }
+            )
+            manualReinstall = @([ordered]@{ name = "Manual App"; classification = "Unknown"; restoreConfidence = "Unknown"; restoreStrategy = "manual-review"; package = "manual" })
+            unsupported = @()
+            unmatchedConfigPaths = @([ordered]@{ name = "unmatched" })
+          }
+          Set-Content -LiteralPath (Join-Path $restoreRoot "manifests\latest.json") -Value ($manifest | ConvertTo-Json -Depth 12) -Encoding UTF8
+
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root $restoreRoot -DryRun
+          Assert-True (-not (Get-ChildItem -LiteralPath (Join-Path $restoreRoot "reports") -Filter "restore-*.md" -ErrorAction SilentlyContinue)) "Dry-run restore should not write restore reports."
+
+          $fakeBin = Join-Path $env:RUNNER_TEMP "WinCarry-FakeBin"
+          New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null
+          $invocationPath = Join-Path $env:RUNNER_TEMP "wincarry-restore-invocations.txt"
+          Remove-Item -LiteralPath $invocationPath -Force -ErrorAction SilentlyContinue
+          $fakeWinget = Join-Path $fakeBin "winget.cmd"
+          Set-Content -LiteralPath $fakeWinget -Encoding ASCII -Value @(
+            '@echo off',
+            'if "%1"=="--version" (',
+            '  echo v-test',
+            '  exit /b 0',
+            ')',
+            ('echo %*>>"{0}"' -f $invocationPath),
+            'echo %* | findstr /C:"Fail.App" >nul',
+            'if not errorlevel 1 exit /b 9',
+            'exit /b 0'
+          )
+          $env:PATH = "$fakeBin;$env:PATH"
+
+          "3`n2`n1,2`nYES`n" | powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root $restoreRoot
+
+          Assert-True (Test-Path -LiteralPath $invocationPath) "Expected fake winget invocation log."
+          $invocations = Get-Content -Raw -LiteralPath $invocationPath
+          Assert-True ($invocations -match "install --id Git\.Git") "Expected Git winget install command."
+          Assert-True ($invocations -match "install --id Fail\.App") "Expected failing winget install command."
+          Assert-True ($invocations -match "--version 2\.42\.0") "Expected detected version argument."
+          Assert-True ($invocations -notmatch "MSIX") "Pseudo inventory IDs should not be installed."
+
+          $restoreReport = Get-ChildItem -LiteralPath (Join-Path $restoreRoot "reports") -Filter "restore-*.md" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          Assert-True ($null -ne $restoreReport) "Expected restore report after non-dry restore."
+          $reportText = Get-Content -Raw -LiteralPath $restoreReport.FullName
+          Assert-True ($reportText -match "Successful commands: 1") "Restore report should record one successful command."
+          Assert-True ($reportText -match "Failed commands: 1") "Restore report should record one failed command."
+          Assert-True ($reportText -match "Config restore is deferred to Phase 8") "Restore report should defer config restore."
+          Assert-True ($reportText -match "Pseudo package") "Restore report should include skipped pseudo package."
 
       - name: Config backup fixture tests
         shell: powershell
