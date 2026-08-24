@@ -30,6 +30,8 @@ WinCarry does not guarantee that every application will work after Windows reins
 
 It intentionally avoids dangerous global Windows changes such as rewriting `ProgramFilesDir` or treating symlinks/junctions as a universal app migration strategy.
 
+For a fuller explanation of the system design and end-to-end flow, see [docs/system-design.md](docs/system-design.md).
+
 ## Requirements
 
 - Windows for real scan, restore, and junction workflows.
@@ -227,6 +229,7 @@ Do not use junction mode as a general replacement for reinstalling apps.
 
 - `wincarry.ps1`: entry point.
 - `lib/`: helper scripts loaded by the entry point.
+- `docs/system-design.md`: system design and end-to-end restore flow.
 - `.github/workflows/windows-smoke.yml`: Windows GitHub Actions smoke tests.
 - `examples/sample-manifest.json`: small redacted sample manifest.
 - `examples/sample-report.md`: small redacted sample report.
