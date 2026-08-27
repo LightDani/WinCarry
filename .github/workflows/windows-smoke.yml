@@ -157,6 +157,8 @@ jobs:
           }
 
           $restoreRoot = Join-Path $env:RUNNER_TEMP "WinCarry-Restore-Fixture"
+          $oldRestoreRoot = "G:\WinCarry-Restore-Fixture"
+          $oldGitConfigBackup = "$oldRestoreRoot\backups\fixture\configs\gitconfig"
           Remove-Item -LiteralPath $restoreRoot -Recurse -Force -ErrorAction SilentlyContinue
           $targetProfile = Join-Path $restoreRoot "TargetProfile"
           $gitConfigBackup = Join-Path $restoreRoot "backups\fixture\configs\gitconfig"
@@ -168,7 +170,7 @@ jobs:
           $manifest = [ordered]@{
             schemaVersion = "1.0"
             createdAt = (Get-Date).ToString("o")
-            root = [ordered]@{ winCarryRoot = $restoreRoot }
+            root = [ordered]@{ winCarryRoot = $oldRestoreRoot }
             apps = @(
               [ordered]@{
                 id = "app-git"
@@ -183,7 +185,7 @@ jobs:
                   originalPath = "C:\Users\Old\.gitconfig"
                   restorePathTemplate = "%USERPROFILE%\.gitconfig"
                   isDirectory = $false
-                  backupPath = $gitConfigBackup
+                  backupPath = $oldGitConfigBackup
                   backupStatus = "backed_up"
                   warnings = @()
                 })
@@ -235,9 +237,16 @@ jobs:
           $dryRunOutput | Write-Host
           $dryRunText = $dryRunOutput -join "`n"
           Assert-True ($dryRunText -match "Package-manager candidates: 3") "Dry-run restore should find three package-manager candidates."
+          Assert-True ($dryRunText -match "Manifest was created with WinCarry root G:\\WinCarry-Restore-Fixture; using current root") "Dry-run restore should warn when manifest metadata root moved."
           Assert-True ($dryRunText -match "Config Restore Plan") "Dry-run restore should show the config restore plan."
+          Assert-True ($dryRunText -notmatch "Backed-up config source was not found") "Dry-run restore should rebase old-root config backup paths to the current root."
           Assert-True ($dryRunText -match "Existing config conflicts: 1") "Dry-run restore should detect existing config conflicts."
           Assert-True (-not (Get-ChildItem -LiteralPath (Join-Path $restoreRoot "reports") -Filter "restore-*.md" -ErrorAction SilentlyContinue)) "Dry-run restore should not write restore reports."
+
+          $missingOldRootOutput = @(powershell -NoProfile -ExecutionPolicy Bypass -File .\wincarry.ps1 restore -Root "G:\WinCarry-Missing-Root" -DryRun 2>&1 | ForEach-Object { [string]$_ })
+          $missingOldRootText = $missingOldRootOutput -join "`n"
+          Assert-True ($missingOldRootText -match "Manifest not found: G:\\WinCarry-Missing-Root\\manifests\\latest\.json") "Missing old root should produce a manifest warning."
+          Assert-True ($missingOldRootText -notmatch "Cannot find drive") "Missing old root should not emit a provider drive error."
 
           $fakeBin = Join-Path $env:RUNNER_TEMP "WinCarry-FakeBin"
           New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null

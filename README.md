@@ -88,6 +88,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\WinCarry\restore-scripts\
 powershell -NoProfile -ExecutionPolicy Bypass -File D:\WinCarry\restore-scripts\restore-latest.ps1
 ```
 
+If Windows assigns a different drive letter after reinstall, run the restore script from the root path that exists now. For example, if the preserved WinCarry root used to be `G:\WinCarry` but is now `D:\WinCarry`, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\WinCarry\restore-scripts\restore-latest.ps1 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\WinCarry\restore-scripts\restore-latest.ps1
+```
+
+WinCarry will warn that the manifest was created with the old root and will use the current root for WinCarry artifact paths.
+
 ## Commands
 
 ```text

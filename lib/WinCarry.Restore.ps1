@@ -11,6 +11,135 @@ function Get-RestoreReportPath {
     return (Join-Path (Join-Path $RootPath "reports") $reportFileName)
 }
 
+
+function ConvertTo-RestorePathText {
+    param(
+        [string]$Path,
+        [bool]$ForComparison = $false
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+
+    $expanded = ([Environment]::ExpandEnvironmentVariables($Path)).Trim()
+    $windowsLike = ((Test-IsWindows) -or ($expanded -match "^[A-Za-z]:[\\/]") -or $expanded.Contains("\"))
+    if ($windowsLike) {
+        $normalized = $expanded.Replace("/", "\")
+    } else {
+        $normalized = $expanded.Replace("\", "/")
+    }
+
+    while ($normalized.Length -gt 1 -and ($normalized.EndsWith("\") -or $normalized.EndsWith("/"))) {
+        if ($windowsLike -and $normalized -match "^[A-Za-z]:\\$") {
+            break
+        }
+        if (-not $windowsLike -and $normalized -eq "/") {
+            break
+        }
+        $normalized = $normalized.Substring(0, $normalized.Length - 1)
+    }
+
+    if ($ForComparison -and $windowsLike) {
+        return $normalized.ToLowerInvariant()
+    }
+
+    return $normalized
+}
+
+function Get-RestoreRelativePathUnderRoot {
+    param(
+        [string]$Path,
+        [string]$Root
+    )
+
+    $pathText = ConvertTo-RestorePathText -Path $Path
+    $rootText = ConvertTo-RestorePathText -Path $Root
+    $pathComparable = ConvertTo-RestorePathText -Path $Path -ForComparison:$true
+    $rootComparable = ConvertTo-RestorePathText -Path $Root -ForComparison:$true
+
+    if ([string]::IsNullOrWhiteSpace($pathComparable) -or [string]::IsNullOrWhiteSpace($rootComparable)) {
+        return $null
+    }
+
+    if ($pathComparable -eq $rootComparable) {
+        return ""
+    }
+
+    $windowsLike = ((Test-IsWindows) -or ($rootText -match "^[A-Za-z]:[\\/]") -or $rootText.Contains("\"))
+    $separator = $(if ($windowsLike) { "\" } else { "/" })
+    $rootPrefix = $rootComparable
+    if (-not $rootPrefix.EndsWith($separator)) {
+        $rootPrefix = $rootPrefix + $separator
+    }
+
+    if (-not $pathComparable.StartsWith($rootPrefix)) {
+        return $null
+    }
+
+    if ($pathText.Length -lt $rootText.Length) {
+        return $null
+    }
+
+    return $pathText.Substring($rootText.Length).TrimStart([char[]]@([char]"\", [char]"/"))
+}
+
+function Join-RestorePathText {
+    param(
+        [string]$Parent,
+        [string]$Child
+    )
+
+    $parentText = ConvertTo-RestorePathText -Path $Parent
+    $windowsLike = ((Test-IsWindows) -or ($parentText -match "^[A-Za-z]:[\\/]") -or $parentText.Contains("\"))
+    $separator = $(if ($windowsLike) { "\" } else { [System.IO.Path]::DirectorySeparatorChar })
+
+    if ([string]::IsNullOrWhiteSpace($Child)) {
+        return $parentText
+    }
+
+    if ($windowsLike) {
+        $childText = $Child.Replace("/", "\")
+    } else {
+        $childText = $Child.Replace("\", [System.IO.Path]::DirectorySeparatorChar)
+    }
+    $childText = $childText.TrimStart([char[]]@([char]"\", [char]"/"))
+
+    if ([string]::IsNullOrWhiteSpace($parentText)) {
+        return $childText
+    }
+    if ([string]::IsNullOrWhiteSpace($childText)) {
+        return $parentText
+    }
+    if ($parentText.EndsWith($separator)) {
+        return ($parentText + $childText)
+    }
+
+    return ($parentText + $separator + $childText)
+}
+
+function Resolve-RestoreArtifactPath {
+    param(
+        [string]$Path,
+        [string]$ManifestRoot,
+        [string]$CurrentRootPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($Path)
+    if (-not [string]::IsNullOrWhiteSpace($ManifestRoot) -and -not [string]::IsNullOrWhiteSpace($CurrentRootPath)) {
+        $relative = Get-RestoreRelativePathUnderRoot -Path $expanded -Root $ManifestRoot
+        if ($null -ne $relative) {
+            return (Join-RestorePathText -Parent $CurrentRootPath -Child $relative)
+        }
+    }
+
+    return (Resolve-DisplayPath -Path $expanded)
+}
+
 function Resolve-RestoreRootPath {
     param(
         [string]$RootPath
@@ -40,7 +169,7 @@ function Resolve-RestoreManifestPath {
     )
 
     if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
-        return (Get-LatestManifestPath -RootPath $RootPath)
+        return (Join-RestorePathText -Parent $RootPath -Child "manifests\latest.json")
     }
 
     $expanded = [Environment]::ExpandEnvironmentVariables($ManifestPath)
@@ -48,7 +177,7 @@ function Resolve-RestoreManifestPath {
         return (Resolve-DisplayPath -Path $expanded)
     }
 
-    return (Resolve-DisplayPath -Path (Join-Path $RootPath $expanded))
+    return (Resolve-DisplayPath -Path (Join-RestorePathText -Parent $RootPath -Child $expanded))
 }
 
 function Test-SameDisplayPath {
@@ -124,7 +253,7 @@ function Read-WinCarryManifest {
         [string]$ManifestPath
     )
 
-    if (-not (Test-Path -LiteralPath $ManifestPath)) {
+    if (-not (Test-Path -LiteralPath $ManifestPath -ErrorAction SilentlyContinue)) {
         Write-Host ""
         Write-WarningText ("Manifest not found: {0}" -f $ManifestPath)
         Write-Info "Run manifest before restore, or copy the preserved WinCarry root that contains manifests\latest.json."
@@ -312,7 +441,11 @@ function Get-ConfigRestoreExistingBackupRootPath {
 }
 
 function Get-ConfigRestoreSourceInfo {
-    param($ConfigPath)
+    param(
+        $ConfigPath,
+        [string]$ManifestRoot = "",
+        [string]$CurrentRootPath = ""
+    )
 
     $backupPath = [string](Get-MapValue -Map $ConfigPath -Key "backupPath")
     $originalPath = [string](Get-MapValue -Map $ConfigPath -Key "originalPath")
@@ -328,7 +461,7 @@ function Get-ConfigRestoreSourceInfo {
         }
     }
 
-    $resolvedBackupPath = Resolve-DisplayPath -Path $backupPath
+    $resolvedBackupPath = Resolve-RestoreArtifactPath -Path $backupPath -ManifestRoot $ManifestRoot -CurrentRootPath $CurrentRootPath
     $hasDirectoryFlag = Test-MapHasKey -Map $ConfigPath -Key "isDirectory"
     $originalIsDirectory = $false
     if ($hasDirectoryFlag) {
@@ -337,16 +470,16 @@ function Get-ConfigRestoreSourceInfo {
 
     if ($hasDirectoryFlag -and $originalIsDirectory) {
         $sourcePath = $resolvedBackupPath
-        $sourceExists = (Test-Path -LiteralPath $sourcePath -PathType Container)
+        $sourceExists = (Test-Path -LiteralPath $sourcePath -PathType Container -ErrorAction SilentlyContinue)
         $sourceIsDirectory = $true
     } else {
         $leaf = Split-Path -Leaf $originalPath
         $fileCandidate = ""
         if (-not [string]::IsNullOrWhiteSpace($leaf)) {
-            $fileCandidate = Join-Path $resolvedBackupPath $leaf
+            $fileCandidate = Join-RestorePathText -Parent $resolvedBackupPath -Child $leaf
         }
 
-        if (-not [string]::IsNullOrWhiteSpace($fileCandidate) -and (Test-Path -LiteralPath $fileCandidate -PathType Leaf)) {
+        if (-not [string]::IsNullOrWhiteSpace($fileCandidate) -and (Test-Path -LiteralPath $fileCandidate -PathType Leaf -ErrorAction SilentlyContinue)) {
             $sourcePath = Resolve-DisplayPath -Path $fileCandidate
             $sourceExists = $true
             $sourceIsDirectory = $false
@@ -354,11 +487,11 @@ function Get-ConfigRestoreSourceInfo {
             $sourcePath = $fileCandidate
             $sourceExists = $false
             $sourceIsDirectory = $false
-        } elseif (Test-Path -LiteralPath $resolvedBackupPath -PathType Container) {
+        } elseif (Test-Path -LiteralPath $resolvedBackupPath -PathType Container -ErrorAction SilentlyContinue) {
             $sourcePath = $resolvedBackupPath
             $sourceExists = $true
             $sourceIsDirectory = $true
-        } elseif (Test-Path -LiteralPath $resolvedBackupPath -PathType Leaf) {
+        } elseif (Test-Path -LiteralPath $resolvedBackupPath -PathType Leaf -ErrorAction SilentlyContinue) {
             $sourcePath = $resolvedBackupPath
             $sourceExists = $true
             $sourceIsDirectory = $false
@@ -510,7 +643,9 @@ function New-ConfigRestoreCandidate {
         [Parameter(Mandatory = $true)]
         [string]$ConflictPolicy,
         [object[]]$CurrentApps = @(),
-        [object[]]$SuccessfulRestoreResults = @()
+        [object[]]$SuccessfulRestoreResults = @(),
+        [string]$ManifestRoot = "",
+        [string]$CurrentRootPath = ""
     )
 
     $linkedToApp = ($null -ne $App)
@@ -542,7 +677,7 @@ function New-ConfigRestoreCandidate {
 
     $restorePathTemplate = [string](Get-MapValue -Map $ConfigPath -Key "restorePathTemplate")
     $targetPath = Resolve-ConfigPathTemplate -Template $restorePathTemplate
-    $sourceInfo = Get-ConfigRestoreSourceInfo -ConfigPath $ConfigPath
+    $sourceInfo = Get-ConfigRestoreSourceInfo -ConfigPath $ConfigPath -ManifestRoot $ManifestRoot -CurrentRootPath $CurrentRootPath
     $sourcePath = [string](Get-MapValue -Map $sourceInfo -Key "sourcePath")
     $sourceExists = [bool](Get-MapValue -Map $sourceInfo -Key "sourceExists")
     $sourceIsDirectory = [bool](Get-MapValue -Map $sourceInfo -Key "sourceIsDirectory")
@@ -683,18 +818,20 @@ function New-ConfigRestorePlan {
         [string]$ExistingBackupRootPath,
 
         [object[]]$CurrentApps = @(),
-        [object[]]$SuccessfulRestoreResults = @()
+        [object[]]$SuccessfulRestoreResults = @(),
+        [string]$ManifestRoot = "",
+        [string]$CurrentRootPath = ""
     )
 
     $candidates = @()
     foreach ($app in @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "apps"))) {
         foreach ($configPath in @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $app -Key "configPaths"))) {
-            $candidates += New-ConfigRestoreCandidate -App $app -ConfigPath $configPath -ConflictPolicy $ConflictPolicy -CurrentApps $CurrentApps -SuccessfulRestoreResults $SuccessfulRestoreResults
+            $candidates += New-ConfigRestoreCandidate -App $app -ConfigPath $configPath -ConflictPolicy $ConflictPolicy -CurrentApps $CurrentApps -SuccessfulRestoreResults $SuccessfulRestoreResults -ManifestRoot $ManifestRoot -CurrentRootPath $CurrentRootPath
         }
     }
 
     foreach ($configPath in @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $Manifest -Key "unmatchedConfigPaths"))) {
-        $candidates += New-ConfigRestoreCandidate -App $null -ConfigPath $configPath -ConflictPolicy $ConflictPolicy -CurrentApps $CurrentApps -SuccessfulRestoreResults $SuccessfulRestoreResults
+        $candidates += New-ConfigRestoreCandidate -App $null -ConfigPath $configPath -ConflictPolicy $ConflictPolicy -CurrentApps $CurrentApps -SuccessfulRestoreResults $SuccessfulRestoreResults -ManifestRoot $ManifestRoot -CurrentRootPath $CurrentRootPath
     }
 
     $summary = Get-ConfigRestoreSummary -Candidates $candidates -ConflictPolicy $ConflictPolicy -ExistingBackupRootPath $ExistingBackupRootPath
@@ -1646,6 +1783,7 @@ function Invoke-Restore {
     }
 
     $manifestOfflineSafe = [bool](Get-MapValue -Map $manifest -Key "offlineSafeMode")
+    $manifestMetadataRoot = Get-ManifestWinCarryRoot -Manifest $manifest
     $preflight = New-PreflightSnapshot -RootPath $resolvedRoot -OfflineSafe:$manifestOfflineSafe
     $warnings = @()
     if ($manifestOfflineSafe) {
@@ -1653,6 +1791,10 @@ function Invoke-Restore {
     }
     foreach ($warning in @(ConvertTo-ArrayValue -Value $preflight.root.warnings)) {
         $warnings += $warning
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($manifestMetadataRoot) -and -not (Test-SameDisplayPath -Left $manifestMetadataRoot -Right $resolvedRoot)) {
+        $warnings += ("Manifest was created with WinCarry root {0}; using current root {1} for WinCarry artifact paths." -f $manifestMetadataRoot, $resolvedRoot)
     }
 
     $manifestFileRoot = Get-RestoreManifestFileRoot -ManifestPath $restoreManifestPath
@@ -1700,7 +1842,7 @@ function Invoke-Restore {
     $currentApps = @(ConvertTo-ArrayValue -Value (Get-MapValue -Map $currentScan -Key "apps"))
 
     $plan = New-RestorePlan -Manifest $manifest -Preflight $preflight -ManifestPath $restoreManifestPath -RootPath $resolvedRoot -SelectionMode $selectionMode -VersionPolicy $versionPolicy -SelectedApps $selectedApps -Warnings $warnings -OfflineSafe:$manifestOfflineSafe
-    $configPreview = New-ConfigRestorePlan -Manifest $manifest -ConflictPolicy "missing-only" -ExistingBackupRootPath $existingConfigBackupRoot -CurrentApps $currentApps
+    $configPreview = New-ConfigRestorePlan -Manifest $manifest -ConflictPolicy "missing-only" -ExistingBackupRootPath $existingConfigBackupRoot -CurrentApps $currentApps -ManifestRoot $manifestMetadataRoot -CurrentRootPath $resolvedRoot
     Set-MapValue -Map $plan -Key "configRestore" -Value $configPreview
     Show-RestorePlan -Plan $plan
 
@@ -1737,7 +1879,7 @@ function Invoke-Restore {
     } else {
         $configPolicy = Read-ConfigRestorePolicy -ConfigRestore (Get-MapValue -Map $plan -Key "configRestore")
     }
-    $configPlan = New-ConfigRestorePlan -Manifest $manifest -ConflictPolicy $configPolicy -ExistingBackupRootPath $existingConfigBackupRoot -CurrentApps $currentApps -SuccessfulRestoreResults $results
+    $configPlan = New-ConfigRestorePlan -Manifest $manifest -ConflictPolicy $configPolicy -ExistingBackupRootPath $existingConfigBackupRoot -CurrentApps $currentApps -SuccessfulRestoreResults $results -ManifestRoot $manifestMetadataRoot -CurrentRootPath $resolvedRoot
     Set-MapValue -Map $plan -Key "configRestore" -Value $configPlan
 
     if ($configPolicy -eq "skip") {

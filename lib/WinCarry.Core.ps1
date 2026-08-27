@@ -477,7 +477,7 @@ function Resolve-DisplayPath {
     $expanded = [Environment]::ExpandEnvironmentVariables($Path)
 
     try {
-        if (Test-Path -LiteralPath $expanded) {
+        if (Test-Path -LiteralPath $expanded -ErrorAction Stop) {
             $resolved = Resolve-Path -LiteralPath $expanded -ErrorAction Stop
             if ($resolved -and $resolved.Path) {
                 return $resolved.Path
